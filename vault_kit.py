@@ -292,8 +292,8 @@ def _ranked(notes, words):
     except sqlite3.Error:
         return None
     with database:
-        database.executemany("INSERT INTO notes VALUES (?, ?)", notes.items())
-        query = " ".join('"' + word.replace('"', '""') + '"*' for word in words)
+        database.executemany("INSERT INTO notes VALUES (?, ?)", ((path, _fold(text)) for path, text in notes.items()))
+        query = " ".join('"' + _fold(word).replace('"', '""') + '"*' for word in words)
         return [path for (path,) in database.execute("SELECT path FROM notes WHERE notes MATCH ? ORDER BY bm25(notes), path", (query,))]
 
 

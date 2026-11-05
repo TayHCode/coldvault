@@ -258,7 +258,7 @@ class VaultKitTests(unittest.TestCase):
 
     def test_search_requires_every_word_and_ranks_the_best_note_first(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
-            _, output = self.build_vault(Path(temporary), "alpha only", "alpha beta once", "beta alpha beta alpha beta", "un caf\u00e9", "die Stra\u00dfe", "foo bar baz")
+            _, output = self.build_vault(Path(temporary), "alpha only", "alpha beta once", "beta alpha beta alpha beta", "un caf\u00e9", "die Stra\u00dfe", "foo bar baz", "\u03ba\u03cc\u03c3\u03bc\u03bf\u03c2")
             for ranked in (True, False):
                 captured = io.StringIO()
                 with contextlib.redirect_stdout(captured):
@@ -283,6 +283,7 @@ class VaultKitTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     if ranked:
                         self.assertEqual([1, 0], [vault_kit.search(output, w) for w in ("cafe", "strasse")])
+                        self.assertEqual(1, vault_kit.search(output, "\u03ba\u03bf\u03c3\u03bc\u03bf\u03c2"))
                     else:
                         with patch.object(vault_kit, "_ranked", return_value=None):
                             self.assertEqual([1, 0], [vault_kit.search(output, w) for w in ("cafe", "strasse")])
