@@ -30,7 +30,7 @@ SECRET_PATTERNS = [re.compile(pattern) for pattern in (
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
 )]
 SECRET_ASSIGNMENT = re.compile(
-    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'])((?:\\.|(?!\2).)*)\2|([^\s"'`,;]+))"""
+    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'])((?:\\[\s\S]|(?!\2)[\s\S])*)\2|([^\s"'`,;]+))"""
 )
 REDACTED = "[REDACTED]"
 
@@ -39,7 +39,7 @@ def _redact_assignment(match):
     prefix, quote, quoted, bare = match.groups()
     if quote:
         return f"{prefix}{quote}{REDACTED}{quote}" if quoted else match.group(0)
-    if re.fullmatch(r"none|null|true|false|\$\{\w+\}|<[\w-]+>|(?:os\.environ|process\.env)\b.*|[A-Za-z_][\w.]*\(.*\)", bare, re.I):
+    if re.fullmatch(r"none|null|true|false|\$\{\w+\}|<[\w-]+>|(?:os\.environ|process\.env)\b.*", bare, re.I):
         return match.group(0)
     return prefix + REDACTED
 
@@ -302,7 +302,7 @@ def _has(word, text):
 def search(vault, term):
     """Print matching lines, most relevant notes first; return how many lines matched."""
     notes = dict(_notes(Path(vault).expanduser()))
-    words = [word.casefold() for word in term.split()]
+    words = re.findall(r"[^\W_]+", term)
     if not words:
         return 0
     ranked = _ranked(notes, words)

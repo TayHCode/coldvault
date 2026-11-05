@@ -22,7 +22,7 @@ Search the vault from a terminal:
 
     python3 vault_kit.py search TERM --vault ./QuickstartVault
 
-Every word must appear somewhere in a note, and each word also matches longer words that start with it. Notes are ranked by relevance with SQLite full-text search when your Python includes it; otherwise they are listed in path order. Each matching line is printed as `path:line: text`.
+Every word must appear somewhere in a note (punctuation and accents are ignored), and each word also matches longer words that start with it. Notes are ranked by relevance with SQLite full-text search when your Python includes it; otherwise they are listed in path order. Each matching line is printed as `path:line: text`.
 
 Existing notes are preserved; when a generated note's filename is already in use, vault-kit writes its copy with `(Vault Kit)` in the name and refreshes only notes marked as vault-kit managed that you have not edited. If you edit a generated note (or it comes from an older vault-kit version and cannot be verified), it is kept and vault-kit writes a fresh copy beside it. Notes are written atomically, so an interrupted run never leaves a half-written note. Links always point at the note vault-kit wrote, and running it again updates sessions whose transcripts have grown.
 
