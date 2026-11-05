@@ -76,7 +76,8 @@ class VaultKitTests(unittest.TestCase):
             with patch.object(vault_kit, "github_repos", return_value=[]):
                 vault_kit.build(source, output)
                 generated_index = output / "Index (Vault Kit).md"
-                generated_index.write_text("---\nvault-kit-managed: true\n---\n\nstale generated content", encoding="utf-8")
+                stale = "---\nvault-kit-managed: true\n---\n\nstale generated content\n"
+                generated_index.write_text(stale.replace("true\n", f"true\nvault-kit-hash: {vault_kit._digest(stale)}\n", 1), encoding="utf-8")
                 vault_kit.build(source, output)
 
             for name, content in existing.items():
@@ -210,14 +211,16 @@ class VaultKitTests(unittest.TestCase):
         ]
         label = "pass" + "word"
         assigned = label + " = " + "hunter" + "2fixture9"
+        lettered = "token: " + "correcthorse" + "batterystaple"
         kept = "token_count = tokenize(text) and api" + "_key = os.environ"
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
-            _, output = self.build_vault(Path(temporary), "\n".join([*keys, assigned, kept]))
+            _, output = self.build_vault(Path(temporary), "\n".join([*keys, assigned, lettered, kept]))
             session = next((output / "Sessions").glob("*.md")).read_text(encoding="utf-8")
         for key in keys:
             self.assertNotIn(key.splitlines()[-1] if "PRIVATE" in key else key, session)
         self.assertNotIn("MIIsynthetic", session)
         self.assertNotIn("hunter2fixture9", session)
+        self.assertNotIn("batterystaple", session)
         self.assertIn(label + " = " + vault_kit.REDACTED, session)
         self.assertIn(kept, session)
 
@@ -235,6 +238,19 @@ class VaultKitTests(unittest.TestCase):
             self.assertNotIn("My own addition", copy.read_text(encoding="utf-8"))
             self.assertEqual([], list(output.rglob(".vault-kit-*")))
 
+    def test_notes_vault_kit_cannot_verify_are_kept(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "Synthetic")
+            note = next((output / "Sessions").glob("*.md"))
+            original = note.read_text(encoding="utf-8")
+            legacy = "---\nvault-kit-managed: true\n---\n\nMy edit to an older note\n"
+            header_edit = original.replace("---\n\n", "tags: mine\n---\n\n", 1)
+            for edited in (legacy, header_edit):
+                note.write_text(edited, encoding="utf-8")
+                with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                    vault_kit.build(source, output)
+                self.assertEqual(edited, note.read_text(encoding="utf-8"))
+
     def test_search_requires_every_word_and_ranks_the_best_note_first(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "alpha only", "alpha beta once", "beta alpha beta alpha beta")
@@ -251,6 +267,12 @@ class VaultKitTests(unittest.TestCase):
                 self.assertFalse(any("alpha only" in line for line in lines))
                 if ranked:
                     self.assertIn("beta alpha beta alpha beta", lines[0])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if ranked:
+                        self.assertEqual(0, vault_kit.search(output, "pha"))
+                    else:
+                        with patch.object(vault_kit, "_ranked", return_value=None):
+                            self.assertEqual(0, vault_kit.search(output, "pha"))
 
 if __name__ == "__main__":
     unittest.main()

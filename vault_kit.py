@@ -36,9 +36,9 @@ REDACTED = "[REDACTED]"
 
 def _redact_assignment(match):
     value = match.group(2)
-    if re.search(r"[A-Za-z]", value) and re.search(r"[0-9]", value) and not re.match(r"[$<{%]|os\.|process\.env", value):
-        return match.group(1) + REDACTED
-    return match.group(0)
+    if "(" in value or re.match(r"[$<{%]|os\.|process\.env|(?:none|null|true|false)$", value, re.I):
+        return match.group(0)
+    return match.group(1) + REDACTED
 
 
 def redact(text):
@@ -127,19 +127,20 @@ def _digest(body):
 
 
 def _is_managed_note(path):
-    """A note is ours to refresh only while its body is exactly what vault-kit wrote."""
     if path.is_symlink() or not path.is_file():
         return False
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return False
-    header, separator, body = text.partition("\n---\n\n")
-    lines = header.splitlines()
+    lines = text.split("\n")
     if _NOTE_MARKER not in lines[:3]:
         return False
-    recorded = next((line[len(_HASH_FIELD):] for line in lines if line.startswith(_HASH_FIELD)), None)
-    return recorded is None or (bool(separator) and recorded == _digest(body))
+    hashed = [index for index, line in enumerate(lines[:3]) if line.startswith(_HASH_FIELD)]
+    if len(hashed) != 1:
+        return False
+    recorded = lines.pop(hashed[0])[len(_HASH_FIELD):]
+    return recorded == _digest("\n".join(lines))
 
 
 def note_target(root, relative):
@@ -170,7 +171,8 @@ def write_note(root, relative, text):
     handle, temporary = tempfile.mkstemp(prefix=".vault-kit-", dir=target.parent)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(f"---\n{_NOTE_MARKER}\n{_HASH_FIELD}{_digest(body)}\n---\n\n{body}")
+            digest = _digest(f"---\n{_NOTE_MARKER}\n---\n\n{body}")
+            stream.write(f"---\n{_NOTE_MARKER}\n{_HASH_FIELD}{digest}\n---\n\n{body}")
         os.replace(temporary, target)
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
@@ -286,6 +288,10 @@ def _ranked(notes, words):
         return [path for (path,) in database.execute("SELECT path FROM notes WHERE notes MATCH ? ORDER BY bm25(notes), path", (query,))]
 
 
+def _has(word, text):
+    return re.search(r"(?<![^\W_])" + re.escape(word), text, re.I) is not None
+
+
 def search(vault, term):
     """Print matching lines, most relevant notes first; return how many lines matched."""
     notes = dict(_notes(Path(vault).expanduser()))
@@ -294,11 +300,11 @@ def search(vault, term):
         return 0
     ranked = _ranked(notes, words)
     if ranked is None:
-        ranked = [path for path, text in notes.items() if all(word in text.casefold() for word in words)]
+        ranked = [path for path, text in notes.items() if all(_has(word, text) for word in words)]
     found = 0
     for path in ranked:
         for number, line in enumerate(notes[path].splitlines(), 1):
-            if any(word in line.casefold() for word in words):
+            if any(_has(word, line) for word in words):
                 print(f"{path}:{number}: {line.strip()}")
                 found += 1
     return found
