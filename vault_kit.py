@@ -30,19 +30,16 @@ SECRET_PATTERNS = [re.compile(pattern) for pattern in (
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
 )]
 SECRET_ASSIGNMENT = re.compile(
-    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'])(.*?)\2|([^\s"'`,;]+))"""
+    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'])((?:\\.|(?!\2).)*)\2|([^\s"'`,;]+))"""
 )
 REDACTED = "[REDACTED]"
 
 
 def _redact_assignment(match):
     prefix, quote, quoted, bare = match.groups()
-    value = quoted if quote else bare
-    if not value or re.match(r"[$<{%]|os\.|process\.env", value):
-        return match.group(0)
     if quote:
-        return f"{prefix}{quote}{REDACTED}{quote}"
-    if re.fullmatch(r"(?:none|null|true|false)|[A-Za-z_][\w.]*\(.*\)", value, re.I):
+        return f"{prefix}{quote}{REDACTED}{quote}" if quoted else match.group(0)
+    if re.fullmatch(r"none|null|true|false|\$\{\w+\}|<[\w-]+>|(?:os\.environ|process\.env)\b.*|[A-Za-z_][\w.]*\(.*\)", bare, re.I):
         return match.group(0)
     return prefix + REDACTED
 
@@ -295,7 +292,7 @@ def _ranked(notes, words):
 
 
 def _fold(text):
-    return "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
+    return "".join(c for c in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(c))
 
 
 def _has(word, text):

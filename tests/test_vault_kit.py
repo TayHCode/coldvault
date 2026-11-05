@@ -212,7 +212,7 @@ class VaultKitTests(unittest.TestCase):
         label = "pass" + "word"
         assigned = label + " = " + "hunter" + "2fixture9"
         lettered = "token: " + "correcthorse" + "batterystaple"
-        quoted = [label + ' = "abcd(efgh)' + '123"', label + " = 'horse " + "battery staple'", label + " = hun" + "ter2"]
+        quoted = [label + ' = "abcd(efgh)' + '123"', label + " = 'horse " + "battery staple'", label + " = hun" + "ter2", label + ' = "$ec' + 'ret123"', label + ' = "abc\\"def' + 'secret"', label + " = $ec" + "ret456"]
         kept = "token_count = tokenize(text) and api" + "_key = os.environ"
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "\n".join([*keys, assigned, lettered, *quoted, kept]))
@@ -222,7 +222,7 @@ class VaultKitTests(unittest.TestCase):
         self.assertNotIn("MIIsynthetic", session)
         self.assertNotIn("hunter2fixture9", session)
         self.assertNotIn("batterystaple", session)
-        for leaked in ("efgh", "horse battery", "hunter2\n"):
+        for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456"):
             self.assertNotIn(leaked, session)
         self.assertIn(label + " = " + vault_kit.REDACTED, session)
         self.assertIn(kept, session)
@@ -256,7 +256,7 @@ class VaultKitTests(unittest.TestCase):
 
     def test_search_requires_every_word_and_ranks_the_best_note_first(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
-            _, output = self.build_vault(Path(temporary), "alpha only", "alpha beta once", "beta alpha beta alpha beta", "un caf\u00e9")
+            _, output = self.build_vault(Path(temporary), "alpha only", "alpha beta once", "beta alpha beta alpha beta", "un caf\u00e9", "die Stra\u00dfe")
             for ranked in (True, False):
                 captured = io.StringIO()
                 with contextlib.redirect_stdout(captured):
@@ -272,10 +272,10 @@ class VaultKitTests(unittest.TestCase):
                     self.assertIn("beta alpha beta alpha beta", lines[0])
                 with contextlib.redirect_stdout(io.StringIO()):
                     if ranked:
-                        self.assertEqual(1, vault_kit.search(output, "cafe"))
+                        self.assertEqual([1, 0], [vault_kit.search(output, w) for w in ("cafe", "strasse")])
                     else:
                         with patch.object(vault_kit, "_ranked", return_value=None):
-                            self.assertEqual(1, vault_kit.search(output, "cafe"))
+                            self.assertEqual([1, 0], [vault_kit.search(output, w) for w in ("cafe", "strasse")])
                 with contextlib.redirect_stdout(io.StringIO()):
                     if ranked:
                         self.assertEqual(0, vault_kit.search(output, "pha"))
