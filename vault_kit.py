@@ -9,6 +9,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -29,16 +30,21 @@ SECRET_PATTERNS = [re.compile(pattern) for pattern in (
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
 )]
 SECRET_ASSIGNMENT = re.compile(
-    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*\s*["']?\s*[=:]\s*["']?)([^\s"'`,;]{8,})"""
+    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'])(.*?)\2|([^\s"'`,;]+))"""
 )
 REDACTED = "[REDACTED]"
 
 
 def _redact_assignment(match):
-    value = match.group(2)
-    if "(" in value or re.match(r"[$<{%]|os\.|process\.env|(?:none|null|true|false)$", value, re.I):
+    prefix, quote, quoted, bare = match.groups()
+    value = quoted if quote else bare
+    if not value or re.match(r"[$<{%]|os\.|process\.env", value):
         return match.group(0)
-    return match.group(1) + REDACTED
+    if quote:
+        return f"{prefix}{quote}{REDACTED}{quote}"
+    if re.fullmatch(r"(?:none|null|true|false)|[A-Za-z_][\w.]*\(.*\)", value, re.I):
+        return match.group(0)
+    return prefix + REDACTED
 
 
 def redact(text):
@@ -288,8 +294,12 @@ def _ranked(notes, words):
         return [path for (path,) in database.execute("SELECT path FROM notes WHERE notes MATCH ? ORDER BY bm25(notes), path", (query,))]
 
 
+def _fold(text):
+    return "".join(c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c))
+
+
 def _has(word, text):
-    return re.search(r"(?<![^\W_])" + re.escape(word), text, re.I) is not None
+    return re.search(r"(?<![^\W_])" + re.escape(_fold(word)), _fold(text)) is not None
 
 
 def search(vault, term):
