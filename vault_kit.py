@@ -6,13 +6,17 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import sys
 import tempfile
 import unicodedata
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+try:
+    import sqlite3
+except ImportError:
+    sqlite3 = None
 
 
 def slug(value):
@@ -30,7 +34,7 @@ SECRET_PATTERNS = [re.compile(pattern) for pattern in (
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
 )]
 SECRET_ASSIGNMENT = re.compile(
-    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'])((?:\\[\s\S]|(?!\2)[\s\S])*)\2|([^\s"'`,;]+))"""
+    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'`])((?:\\[\s\S]|(?!\2)[\s\S])*)\2|([^\s"'`]+))"""
 )
 REDACTED = "[REDACTED]"
 
@@ -280,6 +284,8 @@ def _notes(root):
 
 def _ranked(notes, words):
     """Order notes containing every word by SQLite FTS5 relevance; None when FTS5 is unavailable."""
+    if sqlite3 is None:
+        return None
     try:
         database = sqlite3.connect(":memory:")
         database.execute("CREATE VIRTUAL TABLE notes USING fts5(path UNINDEXED, body)")

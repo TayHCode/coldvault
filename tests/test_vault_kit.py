@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import contextlib
 import io
 import sys
@@ -212,7 +213,7 @@ class VaultKitTests(unittest.TestCase):
         label = "pass" + "word"
         assigned = label + " = " + "hunter" + "2fixture9"
         lettered = "token: " + "correcthorse" + "batterystaple"
-        quoted = [label + ' = "abcd(efgh)' + '123"', label + " = 'horse " + "battery staple'", label + " = hun" + "ter2", label + ' = "$ec' + 'ret123"', label + ' = "abc\\"def' + 'secret"', label + " = $ec" + "ret456", label + " = abc(" + "defsecret2)", label + " = 'multi\nline" + "secret'"]
+        quoted = [label + ' = "abcd(efgh)' + '123"', label + " = 'horse " + "battery staple'", label + " = hun" + "ter2", label + ' = "$ec' + 'ret123"', label + ' = "abc\\"def' + 'secret"', label + " = $ec" + "ret456", label + " = abc(" + "defsecret2)", label + " = 'multi\nline" + "secret'", label + " = `tick" + "secret`", label + " = comma," + "secret"]
         kept = "token = ${TOKEN} and api" + "_key = os.environ"
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "\n".join([*keys, assigned, lettered, *quoted, kept]))
@@ -222,7 +223,7 @@ class VaultKitTests(unittest.TestCase):
         self.assertNotIn("MIIsynthetic", session)
         self.assertNotIn("hunter2fixture9", session)
         self.assertNotIn("batterystaple", session)
-        for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456", "linesecret"):
+        for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456", "linesecret", "ticksecret", "commasecret", ",secret"):
             self.assertNotIn(leaked, session)
         self.assertIn(label + " = " + vault_kit.REDACTED, session)
         self.assertIn(kept, session)
@@ -290,6 +291,16 @@ class VaultKitTests(unittest.TestCase):
                     else:
                         with patch.object(vault_kit, "_ranked", return_value=None):
                             self.assertEqual(0, vault_kit.search(output, "pha"))
+
+    def test_search_works_without_sqlite(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            _, output = self.build_vault(Path(temporary), "alpha beta")
+            with patch.dict(sys.modules, {"sqlite3": None}):
+                spec = importlib.util.spec_from_file_location("vault_kit_without_sqlite", vault_kit.__file__)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(1, module.search(output, "beta alp"))
 
 if __name__ == "__main__":
     unittest.main()
