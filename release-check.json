@@ -2,7 +2,7 @@
   "quickstart": [
     {
       "file": "README.md",
-      "line": 15,
+      "line": 20,
       "argv": [
         "python3",
         "vault_kit.py",

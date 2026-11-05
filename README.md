@@ -1,10 +1,15 @@
-# vault-kit
+# Coldvault
 
 Build a private Obsidian vault from your Claude Code and Codex conversations and public GitHub repositories. Python 3.9 or newer is all you need; there are no packages to install.
 
 ## Quickstart
 
-Clone this repository, then run this one command. It asks for your GitHub username (optional) and where to create the vault. You can instead pass `--transcripts FOLDER` to read a folder of JSONL transcripts.
+Clone this repository and enter it:
+
+    git clone https://github.com/TayHCode/coldvault.git
+    cd coldvault
+
+Then run this one command. It asks for your GitHub username (optional) and where to create the vault. You can instead pass `--transcripts FOLDER` to read a folder of JSONL transcripts.
 
     python3 vault_kit.py
 
@@ -24,7 +29,7 @@ Search the vault from a terminal:
 
 Every word must appear somewhere in a note (punctuation and accents are ignored), and each word also matches longer words that start with it. Notes are ranked by relevance with SQLite full-text search when your Python includes it; otherwise they are listed in path order. Each matching line is printed as `path:line: text`.
 
-Existing notes are preserved; when a generated note's filename is already in use, vault-kit writes its copy with `(Vault Kit)` in the name and refreshes only notes marked as vault-kit managed that you have not edited. If you edit a generated note (or it comes from an older vault-kit version and cannot be verified), it is kept and vault-kit writes a fresh copy beside it. Notes are written atomically, so an interrupted run never leaves a half-written note. Links always point at the note vault-kit wrote, and running it again updates sessions whose transcripts have grown.
+Existing notes are preserved; when a generated note's filename is already in use, Coldvault writes its copy with `(Vault Kit)` in the name and refreshes only notes marked as Coldvault-managed that you have not edited. If you edit a generated note (or it comes from an older version and cannot be verified), it is kept and Coldvault writes a fresh copy beside it. Notes are written atomically, so an interrupted run never leaves a half-written note. Links always point at the note Coldvault wrote, and running it again updates sessions whose transcripts have grown.
 
 ## Privacy
 
