@@ -1,2 +1,2 @@
-{"type":"user","sessionId":"synthetic-session-01","timestamp":"2026-01-12T10:00:00Z","cwd":"/workspace/sample-project","message":{"role":"user","content":"Draft a checklist for the sample parser."}}
-{"type":"assistant","sessionId":"synthetic-session-01","timestamp":"2026-01-12T10:00:05Z","cwd":"/workspace/sample-project","message":{"role":"assistant","content":"Use small fixtures and keep the parser deterministic."}}
+{"type":"user","sessionId":"synthetic-session-one","timestamp":"2026-01-12T10:00:00Z","cwd":"/workspace/sample-project","message":{"role":"user","content":"Draft a checklist for the sample parser."}}
+{"type":"assistant","sessionId":"synthetic-session-one","timestamp":"2026-01-12T10:00:05Z","cwd":"/workspace/sample-project","message":{"role":"assistant","content":"Use small fixtures and keep the parser deterministic."}}

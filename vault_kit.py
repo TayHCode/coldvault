@@ -4,8 +4,11 @@
 import argparse
 import hashlib
 import json
+import os
 import re
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -13,6 +16,35 @@ from urllib.request import Request, urlopen
 
 def slug(value):
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "project"
+
+
+SECRET_PATTERNS = [re.compile(pattern) for pattern in (
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+    r"(?<![A-Za-z0-9])sk-(?:ant-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}",
+    r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})",
+    r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])",
+    r"(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}",
+    r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}",
+    r"(?<![A-Za-z0-9])[sr]k_(?:live|test)_[A-Za-z0-9]{16,}",
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+)]
+SECRET_ASSIGNMENT = re.compile(
+    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*\s*["']?\s*[=:]\s*["']?)([^\s"'`,;]{8,})"""
+)
+REDACTED = "[REDACTED]"
+
+
+def _redact_assignment(match):
+    value = match.group(2)
+    if re.search(r"[A-Za-z]", value) and re.search(r"[0-9]", value) and not re.match(r"[$<{%]|os\.|process\.env", value):
+        return match.group(1) + REDACTED
+    return match.group(0)
+
+
+def redact(text):
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub(REDACTED, text)
+    return SECRET_ASSIGNMENT.sub(_redact_assignment, text)
 
 
 def conversation(record):
@@ -63,7 +95,7 @@ def transcript_info(path):
             dates.append(str(stamp)[:10])
         text = conversation(record)
         if text and text.strip():
-            lines.append(text.strip())
+            lines.append(redact(text.strip()))
     if not lines:
         return None
     day = next((d for d in dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)), "undated")
@@ -87,15 +119,27 @@ def github_repos(username):
 
 
 _NOTE_MARKER = "vault-kit-managed: true"
+_HASH_FIELD = "vault-kit-hash: "
+
+
+def _digest(body):
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _is_managed_note(path):
+    """A note is ours to refresh only while its body is exactly what vault-kit wrote."""
     if path.is_symlink() or not path.is_file():
         return False
     try:
-        return _NOTE_MARKER in path.read_text(encoding="utf-8").splitlines()[:3]
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return False
+    header, separator, body = text.partition("\n---\n\n")
+    lines = header.splitlines()
+    if _NOTE_MARKER not in lines[:3]:
+        return False
+    recorded = next((line[len(_HASH_FIELD):] for line in lines if line.startswith(_HASH_FIELD)), None)
+    return recorded is None or (bool(separator) and recorded == _digest(body))
 
 
 def note_target(root, relative):
@@ -122,7 +166,15 @@ def note_target(root, relative):
 def write_note(root, relative, text):
     target = note_target(root, relative)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(f"---\n{_NOTE_MARKER}\n---\n\n{text.rstrip()}\n", encoding="utf-8")
+    body = f"{text.rstrip()}\n"
+    handle, temporary = tempfile.mkstemp(prefix=".vault-kit-", dir=target.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(f"---\n{_NOTE_MARKER}\n{_HASH_FIELD}{_digest(body)}\n---\n\n{body}")
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
     return target.relative_to(root).as_posix()
 
 
@@ -211,19 +263,43 @@ def _write_vault(root, projects, sessions, repos):
     ))
 
 
-def search(vault, term):
-    root = Path(vault).expanduser()
-    needle, found = term.casefold(), 0
+def _notes(root):
     for path in sorted(root.rglob("*.md")):
         if path.is_symlink():
             continue
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            yield path.relative_to(root).as_posix(), path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        for number, line in enumerate(lines, 1):
-            if needle in line.casefold():
-                print(f"{path.relative_to(root).as_posix()}:{number}: {line.strip()}")
+
+
+def _ranked(notes, words):
+    """Order notes containing every word by SQLite FTS5 relevance; None when FTS5 is unavailable."""
+    try:
+        database = sqlite3.connect(":memory:")
+        database.execute("CREATE VIRTUAL TABLE notes USING fts5(path UNINDEXED, body)")
+    except sqlite3.Error:
+        return None
+    with database:
+        database.executemany("INSERT INTO notes VALUES (?, ?)", notes.items())
+        query = " ".join('"' + word.replace('"', '""') + '"*' for word in words)
+        return [path for (path,) in database.execute("SELECT path FROM notes WHERE notes MATCH ? ORDER BY bm25(notes), path", (query,))]
+
+
+def search(vault, term):
+    """Print matching lines, most relevant notes first; return how many lines matched."""
+    notes = dict(_notes(Path(vault).expanduser()))
+    words = [word.casefold() for word in term.split()]
+    if not words:
+        return 0
+    ranked = _ranked(notes, words)
+    if ranked is None:
+        ranked = [path for path, text in notes.items() if all(word in text.casefold() for word in words)]
+    found = 0
+    for path in ranked:
+        for number, line in enumerate(notes[path].splitlines(), 1):
+            if any(word in line.casefold() for word in words):
+                print(f"{path}:{number}: {line.strip()}")
                 found += 1
     return found
 

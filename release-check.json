@@ -3,13 +3,66 @@
     {
       "file": "README.md",
       "line": 15,
-      "argv": ["python3", "vault_kit.py", "--username", "", "--transcripts", "examples/transcripts", "--output", "./QuickstartVault"]
+      "argv": [
+        "python3",
+        "vault_kit.py",
+        "--username",
+        "",
+        "--transcripts",
+        "examples/transcripts",
+        "--output",
+        "./QuickstartVault"
+      ]
     }
   ],
   "checks": [
     {
-      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"],
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests"
+      ],
       "role": "tests"
+    }
+  ],
+  "approvals": [
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "vault_kit.py",
+      "fingerprint": "aec22e7053a1fc2c",
+      "reason": "The public GitHub API users endpoint, not a local home directory."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "vault_kit.py",
+      "fingerprint": "aec22e7053a1fc2c",
+      "reason": "The public GitHub API users endpoint, not a local home directory."
+    },
+    {
+      "scope": "metadata",
+      "kind": "email",
+      "path": "@commit/0946cfe52dfe",
+      "fingerprint": "cd29c5ac348a026a",
+      "reason": "The public no-reply address in a co-author trailer."
+    },
+    {
+      "scope": "history",
+      "kind": "internal-host",
+      "path": "examples/transcripts/claude/demo-session.jsonl",
+      "fingerprint": "c88934753012e927",
+      "reason": "A synthetic example session ID in an earlier commit, not a host name."
+    },
+    {
+      "scope": "history",
+      "kind": "internal-host",
+      "path": "examples/transcripts/codex/session.jsonl",
+      "fingerprint": "127ea76dac6c8b3d",
+      "reason": "A synthetic example session ID in an earlier commit, not a host name."
     }
   ]
 }

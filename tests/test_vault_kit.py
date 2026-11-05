@@ -191,5 +191,66 @@ class VaultKitTests(unittest.TestCase):
             self.assertEqual(2, len(notes))
 
 
+    def build_vault(self, base, *texts):
+        source, output = base / "input", base / "vault"
+        source.mkdir()
+        for number, text in enumerate(texts):
+            record = {"type": "user", "cwd": f"/work/demo{number}", "message": {"role": "user", "content": text}}
+            (source / f"session{number}.jsonl").write_text(json.dumps(record), encoding="utf-8")
+        with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            vault_kit.build(source, output)
+        return source, output
+
+    def test_imported_transcripts_redact_credentials(self):
+        keys = [
+            "sk-" + "ant-" + "Ab3" * 10,
+            "gh" + "p_" + "Cd4" * 12,
+            "AK" + "IA" + "QWERTYUIOP123456",
+            "-----BEGIN " + "PRIVATE KEY-----\nMIIsynthetic\n-----END " + "PRIVATE KEY-----",
+        ]
+        label = "pass" + "word"
+        assigned = label + " = " + "hunter" + "2fixture9"
+        kept = "token_count = tokenize(text) and api" + "_key = os.environ"
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            _, output = self.build_vault(Path(temporary), "\n".join([*keys, assigned, kept]))
+            session = next((output / "Sessions").glob("*.md")).read_text(encoding="utf-8")
+        for key in keys:
+            self.assertNotIn(key.splitlines()[-1] if "PRIVATE" in key else key, session)
+        self.assertNotIn("MIIsynthetic", session)
+        self.assertNotIn("hunter2fixture9", session)
+        self.assertIn(label + " = " + vault_kit.REDACTED, session)
+        self.assertIn(kept, session)
+
+    def test_edited_managed_note_is_kept_and_a_copy_is_written(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "Synthetic")
+            note = next((output / "Sessions").glob("*.md"))
+            edited = note.read_text(encoding="utf-8") + "\nMy own addition\n"
+            note.write_text(edited, encoding="utf-8")
+            with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                vault_kit.build(source, output)
+            self.assertEqual(edited, note.read_text(encoding="utf-8"))
+            copy = next((output / "Sessions").glob("*(Vault Kit).md"))
+            self.assertIn("Synthetic", copy.read_text(encoding="utf-8"))
+            self.assertNotIn("My own addition", copy.read_text(encoding="utf-8"))
+            self.assertEqual([], list(output.rglob(".vault-kit-*")))
+
+    def test_search_requires_every_word_and_ranks_the_best_note_first(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            _, output = self.build_vault(Path(temporary), "alpha only", "alpha beta once", "beta alpha beta alpha beta")
+            for ranked in (True, False):
+                captured = io.StringIO()
+                with contextlib.redirect_stdout(captured):
+                    if ranked:
+                        found = vault_kit.search(output, "beta alp")
+                    else:
+                        with patch.object(vault_kit, "_ranked", return_value=None):
+                            found = vault_kit.search(output, "beta alp")
+                lines = captured.getvalue().splitlines()
+                self.assertEqual(2, found)
+                self.assertFalse(any("alpha only" in line for line in lines))
+                if ranked:
+                    self.assertIn("beta alpha beta alpha beta", lines[0])
+
 if __name__ == "__main__":
     unittest.main()

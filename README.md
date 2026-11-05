@@ -16,13 +16,15 @@ For an offline example from the repository root:
 
 To skip every prompt, pass all three options: `--username NAME` (use `''` to skip GitHub), `--transcripts FOLDER` and `--output FOLDER`.
 
-It creates `START-HERE.md`, an index, a project note for each repository or detected project, and linked notes for each transcript session. Transcript imports keep conversation text and skip tool outputs.
+It creates `START-HERE.md`, an index, a project note for each repository or detected project, and linked notes for each transcript session. Transcript imports keep conversation text, skip tool outputs, and replace common credential formats (provider API keys, GitHub and Slack tokens, cloud access keys, private keys, JWTs and `password = ...` style assignments) with `[REDACTED]`.
 
 Search the vault from a terminal:
 
     python3 vault_kit.py search TERM --vault ./QuickstartVault
 
-Existing notes are preserved; when a generated note's filename is already in use, vault-kit writes its copy with `(Vault Kit)` in the name and refreshes only notes marked as vault-kit managed. Links always point at the note vault-kit wrote, and running it again updates sessions whose transcripts have grown.
+Every word must appear somewhere in a note, and each word also matches longer words that start with it. Notes are ranked by relevance with SQLite full-text search when your Python includes it; otherwise they are listed in path order. Each matching line is printed as `path:line: text`.
+
+Existing notes are preserved; when a generated note's filename is already in use, vault-kit writes its copy with `(Vault Kit)` in the name and refreshes only notes marked as vault-kit managed that you have not edited. If you edit a generated note, it is kept and vault-kit writes a fresh copy beside it. Notes are written atomically, so an interrupted run never leaves a half-written note. Links always point at the note vault-kit wrote, and running it again updates sessions whose transcripts have grown.
 
 ## Privacy
 
