@@ -213,7 +213,7 @@ class VaultKitTests(unittest.TestCase):
         label = "pass" + "word"
         assigned = label + " = " + "hunter" + "2fixture9"
         lettered = "token: " + "correcthorse" + "batterystaple"
-        quoted = [label + ' = "abcd(efgh)' + '123"', label + " = 'horse " + "battery staple'", label + " = hun" + "ter2", label + ' = "$ec' + 'ret123"', label + ' = "abc\\"def' + 'secret"', label + " = $ec" + "ret456", label + " = abc(" + "defsecret2)", label + " = 'multi\nline" + "secret'", label + " = `tick" + "secret`", label + " = comma," + "secret"]
+        quoted = [label + ' = "abcd(efgh)' + '123"', label + " = 'horse " + "battery staple'", label + " = hun" + "ter2", label + ' = "$ec' + 'ret123"', label + ' = "abc\\"def' + 'secret"', label + " = $ec" + "ret456", label + " = abc(" + "defsecret2)", label + " = 'multi\nline" + "secret'", label + " = `tick" + "secret`", label + " = comma," + "secret", "AWS_SECRET_" + "ACCESS_KEY=abcdef" + "0123456789"]
         kept = "token = ${TOKEN} and api" + "_key = os.environ"
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "\n".join([*keys, assigned, lettered, *quoted, kept]))
@@ -223,10 +223,11 @@ class VaultKitTests(unittest.TestCase):
         self.assertNotIn("MIIsynthetic", session)
         self.assertNotIn("hunter2fixture9", session)
         self.assertNotIn("batterystaple", session)
-        for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456", "linesecret", "ticksecret", "commasecret", ",secret"):
+        for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456", "linesecret", "ticksecret", "commasecret", ",secret", "abcdef0123456789"):
             self.assertNotIn(leaked, session)
         self.assertIn(label + " = " + vault_kit.REDACTED, session)
         self.assertIn(kept, session)
+        self.assertIn(label + " =\nplease continue", vault_kit.redact(label + " =\nplease continue"))
 
     def test_edited_managed_note_is_kept_and_a_copy_is_written(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:

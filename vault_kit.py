@@ -34,7 +34,7 @@ SECRET_PATTERNS = [re.compile(pattern) for pattern in (
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
 )]
 SECRET_ASSIGNMENT = re.compile(
-    r"""(?i)\b((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?\s*[=:]\s*)(?:(["'`])((?:\\[\s\S]|(?!\2)[\s\S])*)\2|([^\s"'`]+))"""
+    r"""(?i)(?<![a-z0-9])((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)[a-z0-9_]*["']?[ \t]*[=:][ \t]*)(?:(["'`])((?:\\[\s\S]|(?!\2)[\s\S])*)\2|([^\s"'`]+))"""
 )
 REDACTED = "[REDACTED]"
 
