@@ -2,7 +2,7 @@
   "quickstart": [
     {
       "file": "README.md",
-      "line": 20,
+      "line": 25,
       "argv": [
         "python3",
         "vault_kit.py",
@@ -13,9 +13,31 @@
         "--output",
         "./QuickstartVault"
       ]
+    },
+    {
+      "file": "README.md",
+      "line": 31,
+      "argv": [
+        "python3",
+        "vault_kit.py",
+        "--notes",
+        "examples/notes",
+        "--output",
+        "./NotesVault"
+      ]
     }
   ],
   "checks": [
+    {
+      "argv": [
+        "python3",
+        "-m",
+        "pip",
+        "install",
+        "."
+      ],
+      "role": "build"
+    },
     {
       "argv": [
         "python3",

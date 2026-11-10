@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldvault"
+dynamic = ["version"]
+description = "Build a private Obsidian vault from Claude Code and Codex transcripts, Markdown folders and Notion exports."
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+coldvault = "vault_kit:main"
+
+[tool.setuptools]
+py-modules = ["vault_kit"]
+
+[tool.setuptools.dynamic]
+version = {attr = "vault_kit.__version__"}
