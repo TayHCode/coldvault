@@ -16,14 +16,15 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
-import vault_kit
+import coldvault
 
 
 SCRATCH = Path(__file__).resolve().parents[1] / ".scratch"
 SCRATCH.mkdir(exist_ok=True)
+TEMPLATE_TOP = [".obsidian", "Agent-Space", "Attachments", "Capabilities", "Context", "Daily", "Home.md", "Templates", "Writing"]
 GITHUB_USER_REPOS = "https://api.github.com/" + "users/synthetic-user/repos?per_page=100&sort=updated"
 
 
@@ -35,12 +36,17 @@ def scan_has(word, text):
     return re.search(r"(?<![^\W_])" + re.escape(scan_fold(word)), scan_fold(text)) is not None
 
 
+
+def notes_and_caches(output):
+    receipts = {output / ".coldvault" / "last-run.json", output / ".coldvault" / "runs.jsonl"}
+    return {p: p.read_bytes() for p in output.rglob("*") if p.is_file() and p not in receipts}
+
 class VaultKitTests(unittest.TestCase):
     def test_imports_conversation_and_skips_tool_outputs(self):
-        self.assertEqual("hello", vault_kit.conversation({
+        self.assertEqual("hello", coldvault.conversation({
             "type": "user", "message": {"role": "user", "content": "hello"}
         }))
-        self.assertEqual("visible", vault_kit.conversation({
+        self.assertEqual("visible", coldvault.conversation({
             "type": "response_item", "payload": {
                 "type": "message", "role": "assistant", "content": [
                     {"type": "output_text", "text": "visible"},
@@ -48,9 +54,47 @@ class VaultKitTests(unittest.TestCase):
                 ]
             }
         }))
-        self.assertIsNone(vault_kit.conversation({
+        self.assertIsNone(coldvault.conversation({
             "type": "response_item", "payload": {"type": "function_call", "name": "private"}
         }))
+
+    def test_a_registered_source_adds_notes_and_reports_its_count(self):
+        def bookmarks(run):
+            return [("Imported/Bookmarks/reading.md", "# Reading\n\nSynthetic bookmark", {})]
+
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            output = Path(temporary) / "vault"
+            with patch.object(coldvault, "SOURCES", [*coldvault.SOURCES, ("bookmarks", bookmarks)]), contextlib.redirect_stdout(io.StringIO()):
+                sources = coldvault.build_from_files([], output, "")
+            self.assertEqual({"state": "ok", "count": 1}, sources["bookmarks"])
+            self.assertEqual("skipped", sources["transcripts"]["state"])
+            self.assertIn("Synthetic bookmark", (output / "Imported" / "Bookmarks" / "reading.md").read_text())
+            self.assertIn("[[Imported/Bookmarks/reading]]", (output / "Index.md").read_text())
+
+    def test_a_run_without_transcripts_forgets_cached_transcripts(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            source.mkdir()
+            (source / "session.jsonl").write_text(json.dumps({"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Cached question"}}), encoding="utf-8")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+                self.assertIn("Cached question", (output / ".coldvault" / "transcripts.json").read_text())
+                sources = coldvault.build_from_files([], output, "")
+            self.assertEqual({"state": "skipped"}, sources["transcripts"])
+            self.assertEqual({}, json.loads((output / ".coldvault" / "transcripts.json").read_text())["files"])
+
+    def test_a_source_that_fails_while_listing_is_recorded_as_failed(self):
+        def broken(run):
+            yield ("Imported/Broken/first.md", "first", {})
+            raise coldvault.SourceError("synthetic outage")
+
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            output = Path(temporary) / "vault"
+            with patch.object(coldvault, "SOURCES", [*coldvault.SOURCES, ("broken", broken)]), contextlib.redirect_stdout(io.StringIO()):
+                sources = coldvault.build_from_files([], output, "")
+            self.assertEqual({"state": "failed", "reason": "synthetic outage"}, sources["broken"])
+            self.assertFalse((output / "Imported" / "Broken").exists())
 
     def test_build_creates_linked_notes_from_synthetic_fixture(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -63,11 +107,11 @@ class VaultKitTests(unittest.TestCase):
                 {"type": "tool_result", "content": "Synthetic tool output"},
             ]
             (source / "session.jsonl").write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
             self.assertTrue((output / "START-HERE.md").is_file())
             self.assertIn("[[Index]]", (output / "START-HERE.md").read_text())
-            self.assertIn("vault_kit.py search TERM --vault DIR", (output / "START-HERE.md").read_text())
+            self.assertIn("coldvault.py search TERM --vault DIR", (output / "START-HERE.md").read_text())
             self.assertIn("[[Projects/demo]]", (output / "Index.md").read_text())
             project = (output / "Projects" / "demo.md").read_text()
             self.assertIn("[[Sessions/2026-02-03-demo-", project)
@@ -76,7 +120,7 @@ class VaultKitTests(unittest.TestCase):
             self.assertIn("Synthetic question", session)
             self.assertIn("Synthetic answer", session)
             self.assertNotIn("Synthetic tool output", session)
-            self.assertEqual(["Index.md", "Projects", "START-HERE.md", "Sessions"], sorted(p.name for p in output.iterdir()))
+            self.assertEqual(sorted([".coldvault", "Index.md", "Projects", "START-HERE.md", "Sessions", *TEMPLATE_TOP]), sorted(p.name for p in output.iterdir()))
 
     def test_existing_notes_survive_and_managed_notes_refresh(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -93,12 +137,12 @@ class VaultKitTests(unittest.TestCase):
             record = {"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
             (source / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
 
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
                 generated_index = output / "Index (Vault Kit).md"
                 stale = "---\nvault-kit-managed: true\n---\n\nstale generated content\n"
-                generated_index.write_text(stale.replace("true\n", f"true\nvault-kit-hash: {vault_kit._digest(stale)}\n", 1), encoding="utf-8")
-                vault_kit.build(source, output)
+                generated_index.write_text(stale.replace("true\n", f"true\nvault-kit-hash: {coldvault._digest(stale)}\n", 1), encoding="utf-8")
+                coldvault.build(source, output)
 
             for name, content in existing.items():
                 self.assertEqual(content, (output / name).read_bytes())
@@ -116,8 +160,8 @@ class VaultKitTests(unittest.TestCase):
             (output / "Projects" / "demo.md").write_text("mine", encoding="utf-8")
             record = {"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
             (source / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
             self.assertEqual("mine", (output / "Projects" / "demo.md").read_text())
             session = next((output / "Sessions").glob("*.md")).read_text()
             self.assertIn("[[Projects/demo (Coldvault)]]", session)
@@ -135,8 +179,8 @@ class VaultKitTests(unittest.TestCase):
                 record = {"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": cwd, "message": {"role": "user", "content": text}}
                 (source / f"{name}.jsonl").write_text(json.dumps(record), encoding="utf-8")
             for _ in range(2):
-                with patch.object(vault_kit, "github_repos", return_value=[]):
-                    vault_kit.build(source, output)
+                with patch.object(coldvault, "github_repos", return_value=[]):
+                    coldvault.build(source, output)
             index = (output / "Index.md").read_text()
             targets = [line.split("[[")[1].split("]]")[0] for line in index.splitlines() if line.startswith("- [[")]
             self.assertEqual(2, len(set(targets)))
@@ -147,7 +191,7 @@ class VaultKitTests(unittest.TestCase):
                 self.assertIn(f"[[Sessions/{session.stem}]]", (output / f"{project}.md").read_text())
 
     def test_hash_suffixed_slug_never_reuses_a_taken_slug(self):
-        suffix = vault_kit.hashlib.sha1("scratch".encode()).hexdigest()[:8]
+        suffix = coldvault.hashlib.sha1("scratch".encode()).hexdigest()[:8]
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             base = Path(temporary)
             source, output = base / "input", base / "vault"
@@ -155,8 +199,8 @@ class VaultKitTests(unittest.TestCase):
             for number, name in enumerate([".scratch", f".scratch-{suffix}", "scratch"]):
                 record = {"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": f"/work/{name}", "message": {"role": "user", "content": f"question {number}"}}
                 (source / f"{number}.jsonl").write_text(json.dumps(record), encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
             self.assertEqual(3, len(list((output / "Projects").glob("*.md"))))
 
     def test_refresh_updates_grown_transcript_in_place(self):
@@ -168,10 +212,10 @@ class VaultKitTests(unittest.TestCase):
             first = {"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": "/work/demo", "message": {"role": "user", "content": "First message"}}
             second = {"type": "assistant", "timestamp": "2026-02-03T10:00:01Z", "cwd": "/work/other", "message": {"role": "assistant", "content": "Second message"}}
             transcript.write_text(json.dumps(first), encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
                 transcript.write_text(json.dumps(first) + "\n" + json.dumps(second), encoding="utf-8")
-                vault_kit.build(source, output)
+                coldvault.build(source, output)
             notes = list((output / "Sessions").glob("*.md"))
             self.assertEqual(1, len(notes))
             self.assertIn("Second message", notes[0].read_text())
@@ -184,14 +228,15 @@ class VaultKitTests(unittest.TestCase):
             source.mkdir()
             record = {"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
             (source / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
                 managed = next((output / "Sessions").glob("*.md"))
                 managed.write_text("my own edit", encoding="utf-8")
-                vault_kit.build(source, output)
+                coldvault.build(source, output)
             self.assertEqual("my own edit", managed.read_text())
-            copy = next(p for p in (output / "Sessions").glob("*(Coldvault).md"))
-            self.assertIn("Synthetic", copy.read_text())
+            continued = managed.with_name(f"{managed.stem} (continued).md")
+            self.assertEqual(sorted([managed.name, continued.name]), sorted(p.name for p in (output / "Sessions").iterdir()))
+            self.assertIn("Synthetic", continued.read_text())
 
     def test_search_finds_terms_in_built_vault(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -200,17 +245,17 @@ class VaultKitTests(unittest.TestCase):
             source.mkdir()
             record = {"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Findable Needle here"}}
             (source / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]):
+                coldvault.build(source, output)
             captured = io.StringIO()
             with contextlib.redirect_stdout(captured):
-                self.assertEqual(1, vault_kit.search(output, "needle"))
-                self.assertEqual(0, vault_kit.search(output, "absent-term"))
+                self.assertEqual(1, coldvault.search(output, "needle"))
+                self.assertEqual(0, coldvault.search(output, "absent-term"))
             self.assertIn("Findable Needle here", captured.getvalue())
-            with patch.object(sys, "argv", ["vault_kit.py", "search", "needle", "--vault", str(output)]):
+            with patch.object(sys, "argv", ["coldvault.py", "search", "needle", "--vault", str(output)]):
                 with contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaises(SystemExit) as raised:
-                        vault_kit.main()
+                        coldvault.main()
             self.assertEqual(0, raised.exception.code)
 
     def test_search_json_lists_path_line_and_text_and_exits_1_on_no_hits(self):
@@ -220,10 +265,10 @@ class VaultKitTests(unittest.TestCase):
             (vault / "Notes" / "a.md").write_text("intro\n  Findable needle here  \n", encoding="utf-8")
 
             def run(term):
-                argv = ["vault_kit.py", "search", term, "--vault", str(vault), "--json"]
+                argv = ["coldvault.py", "search", term, "--vault", str(vault), "--json"]
                 with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()) as printed:
                     with self.assertRaises(SystemExit) as raised:
-                        vault_kit.main()
+                        coldvault.main()
                 return raised.exception.code, json.loads(printed.getvalue())
 
             self.assertEqual((0, [{"path": "Notes/a.md", "line": 2, "text": "Findable needle here"}]), run("needle"))
@@ -236,17 +281,17 @@ class VaultKitTests(unittest.TestCase):
             output = base / "vault"
             output.mkdir()
             with self.assertRaises(ValueError):
-                vault_kit.write_note(output, "../outside.md", "no")
+                coldvault.write_note(output, "../outside.md", "no")
             self.assertFalse((base / "outside.md").exists())
 
     def test_empty_username_never_calls_github(self):
-        with patch.object(vault_kit, "urlopen", side_effect=AssertionError("network called")):
-            self.assertEqual([], vault_kit.github_repos(""))
+        with patch.object(coldvault, "urlopen", side_effect=AssertionError("network called")):
+            self.assertEqual([], coldvault.github_repos(""))
 
-    def test_github_failure_is_skipped(self):
-        with patch.object(vault_kit, "urlopen", side_effect=URLError("offline")):
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual([], vault_kit.github_repos("synthetic-user"))
+    def test_github_failure_is_reported(self):
+        with patch.object(coldvault, "urlopen", side_effect=URLError("offline")):
+            with self.assertRaisesRegex(coldvault.SourceError, "offline"):
+                coldvault.github_repos("synthetic-user")
 
     def fake_github(self, pages):
         requests = []
@@ -270,8 +315,8 @@ class VaultKitTests(unittest.TestCase):
 
     def test_github_lookup_follows_every_page(self):
         requests, respond = self.fake_github(self.two_page_api())
-        with patch.dict(os.environ, {}, clear=True), patch.object(vault_kit, "urlopen", side_effect=respond):
-            repos = vault_kit.github_repos("synthetic-user")
+        with patch.dict(os.environ, {}, clear=True), patch.object(coldvault, "urlopen", side_effect=respond):
+            repos = coldvault.github_repos("synthetic-user")
         self.assertEqual([f"repo-{n}" for n in range(150)], [repo["name"] for repo in repos])
         self.assertEqual(2, len(requests))
         self.assertTrue(all(request.get_header("Authorization") is None for request in requests))
@@ -284,12 +329,12 @@ class VaultKitTests(unittest.TestCase):
             (base / "input").mkdir()
             record = {"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
             (base / "input" / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
-            argv = ["vault_kit.py", "--username", "synthetic-user", "--transcripts", str(base / "input"), "--output", str(base / "vault")]
+            argv = ["coldvault.py", "--username", "synthetic-user", "--transcripts", str(base / "input"), "--output", str(base / "vault")]
             out, err = io.StringIO(), io.StringIO()
             with patch.dict(os.environ, {"GITHUB_TOKEN": token}), patch.object(sys, "argv", argv), \
-                    patch.object(vault_kit, "urlopen", side_effect=respond), \
+                    patch.object(coldvault, "urlopen", side_effect=respond), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                vault_kit.main()
+                coldvault.main()
             self.assertEqual(2, len(requests))
             self.assertTrue(all(request.get_header("Authorization") == f"Bearer {token}" for request in requests))
             self.assertTrue((base / "vault" / "Projects" / "repo-149.md").is_file())
@@ -300,40 +345,126 @@ class VaultKitTests(unittest.TestCase):
         first = GITHUB_USER_REPOS
         elsewhere = "https://example.invalid/steal?page=2"
         requests, respond = self.fake_github({first: ([{"name": "only"}], f'<{elsewhere}>; rel="next"')})
-        with patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_" + "S" * 36}), patch.object(vault_kit, "urlopen", side_effect=respond):
-            self.assertEqual(["only"], [repo["name"] for repo in vault_kit.github_repos("synthetic-user")])
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_" + "S" * 36}), patch.object(coldvault, "urlopen", side_effect=respond):
+            self.assertEqual(["only"], [repo["name"] for repo in coldvault.github_repos("synthetic-user")])
         self.assertEqual([first], [request.full_url for request in requests])
 
     def test_github_token_with_trailing_newline_is_trimmed(self):
         token = "ghp_" + "S" * 36
         requests, respond = self.fake_github(self.two_page_api())
-        with patch.dict(os.environ, {"GITHUB_TOKEN": token + "\n"}), patch.object(vault_kit, "urlopen", side_effect=respond):
-            self.assertEqual(150, len(vault_kit.github_repos("synthetic-user")))
+        with patch.dict(os.environ, {"GITHUB_TOKEN": token + "\n"}), patch.object(coldvault, "urlopen", side_effect=respond):
+            self.assertEqual(150, len(coldvault.github_repos("synthetic-user")))
         self.assertTrue(all(request.get_header("Authorization") == f"Bearer {token}" for request in requests))
 
     def test_malformed_github_token_never_reaches_error_output(self):
         token = "ghp_" + "S" * 18 + "\n" + "S" * 18
-        err = io.StringIO()
         with patch.dict(os.environ, {"GITHUB_TOKEN": token}), \
                 patch("socket.create_connection", side_effect=AssertionError("network called")), \
-                contextlib.redirect_stderr(err):
-            self.assertEqual([], vault_kit.github_repos("synthetic-user"))
-        self.assertIn("GitHub lookup skipped", err.getvalue())
-        self.assertNotIn("S" * 18, err.getvalue())
+                self.assertRaisesRegex(coldvault.SourceError, "GITHUB_TOKEN contains spaces") as raised:
+            coldvault.github_repos("synthetic-user")
+        self.assertNotIn("S" * 18, str(raised.exception))
 
     def test_default_finds_both_tools_standard_folders(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            for folder in (home / ".claude" / "projects", home / ".codex" / "sessions"):
+            for folder in (home / ".claude" / "projects", home / ".codex" / "sessions", home / ".codex" / "archived_sessions"):
                 folder.mkdir(parents=True)
                 record = {"type": "user", "cwd": f"/work/{folder.name}", "message": {"role": "user", "content": "Synthetic"}}
                 (folder / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
-            with patch.object(Path, "home", return_value=home), patch.object(sys, "argv", ["vault_kit.py", "--username", "synthetic-user", "--output", str(home / "vault")]), patch.object(vault_kit, "github_repos", return_value=[]):
+            with patch.object(Path, "home", return_value=home), patch.object(sys, "argv", ["coldvault.py", "--username", "synthetic-user", "--output", str(home / "vault")]), patch.object(coldvault, "github_repos", return_value=[]):
                 with contextlib.redirect_stdout(io.StringIO()):
-                    vault_kit.main()
+                    coldvault.main()
             notes = list((home / "vault" / "Sessions").glob("*.md"))
-            self.assertEqual(2, len(notes))
+            self.assertEqual(3, len(notes))
 
+
+    def test_sessions_stay_linked_after_their_transcript_is_deleted(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "kept question", "live question")
+            first = {note.read_text(encoding="utf-8"): note for note in (output / "Sessions").glob("*.md")}
+            gone = next(note for text, note in first.items() if "kept question" in text)
+            snapshot = gone.read_bytes()
+            (source / "session0.jsonl").unlink()
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+            self.assertEqual(snapshot, gone.read_bytes())
+            index = (output / "Index.md").read_text(encoding="utf-8")
+            for number in range(2):
+                project = output / "Projects" / f"demo{number}.md"
+                self.assertIn(f"[[Projects/demo{number}]]", index)
+                self.assertEqual(1, len(re.findall(r"\[\[Sessions/", project.read_text(encoding="utf-8"))))
+            self.assertIn(f"[[{gone.relative_to(output).with_suffix('').as_posix()}]]", (output / "Projects" / "demo0.md").read_text(encoding="utf-8"))
+            self.assertEqual(2, len(list((output / "Sessions").glob("*.md"))))
+
+    def test_a_kept_session_stays_linked_when_another_project_reuses_its_file_name(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            for project in ("alpha", "beta"):
+                (source / project).mkdir(parents=True)
+                record = {"type": "user", "cwd": f"/work/{project}", "message": {"role": "user", "content": f"{project} question"}}
+                (source / project / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+                (source / "alpha" / "session.jsonl").unlink()
+                coldvault.build(source, output)
+            self.assertIn("[[Projects/alpha]]", (output / "Index.md").read_text(encoding="utf-8"))
+            self.assertEqual(1, len(re.findall(r"\[\[Sessions/", (output / "Projects" / "alpha.md").read_text(encoding="utf-8"))))
+
+    def test_a_kept_note_from_an_older_version_joins_its_project_when_it_reappears(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "older question")
+            old = next((output / "Sessions").glob("*.md"))
+            text = old.read_text(encoding="utf-8")
+            lines = [line for line in text.split("\n") if not line.startswith(("project-key: ", "coldvault-hash: "))]
+            lines.insert(2, "coldvault-hash: " + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest())
+            old.write_text("\n".join(lines), encoding="utf-8")
+            (source / "session0.jsonl").unlink()
+
+            def build():
+                with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                    coldvault.build_from_files(sorted(source.rglob("*.jsonl")), output, "")
+
+            build()
+            self.assertIn("[[Projects/demo0]]", (output / "Index.md").read_text(encoding="utf-8"))
+            record = {"type": "user", "cwd": "/work/demo0", "message": {"role": "user", "content": "newer question"}}
+            (source / "later.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            build()
+            self.assertEqual(["demo0.md"], sorted(note.name for note in (output / "Projects").glob("*.md")))
+            self.assertEqual(2, len(re.findall(r"\[\[Sessions/", (output / "Projects" / "demo0.md").read_text(encoding="utf-8"))))
+
+    def test_a_kept_session_stays_linked_beside_a_live_session_with_the_same_file_name(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            for folder in ("a", "b"):
+                (source / folder).mkdir(parents=True)
+                record = {"type": "user", "cwd": "/work/shared", "message": {"role": "user", "content": f"{folder} question"}}
+                (source / folder / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+                (source / "b" / "session.jsonl").unlink()
+                coldvault.build(source, output)
+            self.assertEqual(2, len(re.findall(r"\[\[Sessions/", (output / "Projects" / "shared.md").read_text(encoding="utf-8"))))
+
+    def test_kept_session_notes_join_live_sessions_of_the_same_project(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            source.mkdir()
+            for name, text in (("a", "older question"), ("b", "newer question")):
+                record = {"type": "user", "sessionId": name, "cwd": "/work/shared", "message": {"role": "user", "content": text}}
+                (source / f"{name}.jsonl").write_text(json.dumps(record), encoding="utf-8")
+
+            def build():
+                with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                    coldvault.build(source, output)
+
+            build()
+            (source / "a.jsonl").unlink()
+            build()
+            self.assertEqual(["shared.md"], sorted(note.name for note in (output / "Projects").glob("*.md")))
+            self.assertEqual(2, len(re.findall(r"\[\[Sessions/", (output / "Projects" / "shared.md").read_text(encoding="utf-8"))))
 
     def build_vault(self, base, *texts):
         source, output = base / "input", base / "vault"
@@ -341,9 +472,95 @@ class VaultKitTests(unittest.TestCase):
         for number, text in enumerate(texts):
             record = {"type": "user", "cwd": f"/work/demo{number}", "message": {"role": "user", "content": text}}
             (source / f"session{number}.jsonl").write_text(json.dumps(record), encoding="utf-8")
-        with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
-            vault_kit.build(source, output)
+        with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            coldvault.build(source, output)
         return source, output
+
+    def rebuild_and_list_rewritten(self, source, output, notes=()):
+        for note in output.rglob("*.md"):
+            os.utime(note, ns=(10**18, 10**18))
+        with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            coldvault.build_from_files(sorted(source.rglob("*.jsonl")), output, "", notes)
+        return sorted(note.relative_to(output).as_posix() for note in output.rglob("*.md") if note.stat().st_mtime_ns != 10**18)
+
+    def test_rerun_on_unchanged_inputs_rewrites_no_note_and_parses_no_transcript(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            notes = base / "notes"
+            notes.mkdir()
+            (notes / "Plan.md").write_text("# Plan\n", encoding="utf-8")
+            source, output = self.build_vault(base, "first", "second")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build_from_files(sorted(source.rglob("*.jsonl")), output, "", [notes])
+            before = {note: note.read_bytes() for note in output.rglob("*.md")}
+            self.assertEqual(8 + sum(name.endswith(".md") for name in coldvault.VAULT_TEMPLATE), len(before))
+            with patch.object(coldvault, "transcript_info", side_effect=AssertionError("re-parsed an unchanged transcript")):
+                self.assertEqual([], self.rebuild_and_list_rewritten(source, output, [notes]))
+            self.assertEqual(before, {note: note.read_bytes() for note in output.rglob("*.md")})
+
+    def test_grown_transcript_rewrites_only_its_session_note(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "first", "second")
+            grown = source / "session0.jsonl"
+            record = {"type": "assistant", "message": {"role": "assistant", "content": "grown reply"}}
+            grown.write_text(grown.read_text(encoding="utf-8") + "\n" + json.dumps(record), encoding="utf-8")
+            rewritten = self.rebuild_and_list_rewritten(source, output)
+            self.assertEqual(1, len(rewritten))
+            self.assertTrue(rewritten[0].startswith("Sessions/undated-demo0-"))
+            self.assertIn("grown reply", (output / rewritten[0]).read_text(encoding="utf-8"))
+            self.assertIn(f"[[{rewritten[0].removesuffix('.md')}]]", (output / "Projects" / "demo0.md").read_text(encoding="utf-8"))
+
+    def test_corrupt_transcript_cache_is_ignored(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "first")
+            for broken in ("not json", '{"tag": "x", "files": {}}', json.dumps({"tag": coldvault._CACHE_TAG, "files": {"a": ["s", "text"]}})):
+                (output / ".coldvault" / "transcripts.json").write_text(broken, encoding="utf-8")
+                self.assertEqual([], self.rebuild_and_list_rewritten(source, output))
+                self.assertEqual(coldvault._CACHE_TAG, json.loads((output / ".coldvault" / "transcripts.json").read_text(encoding="utf-8"))["tag"])
+
+    def test_build_never_writes_its_transcript_cache_through_a_symlink(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = self.build_vault(base, "first")
+            outside = base / "outside"
+            outside.mkdir()
+            shutil.rmtree(output / ".coldvault")
+            (output / ".coldvault").symlink_to(outside, target_is_directory=True)
+            (source / "session0.jsonl").write_text(json.dumps({"type": "user", "cwd": "/work/demo0", "message": {"role": "user", "content": "changed"}}), encoding="utf-8")
+            self.assertEqual(1, len(self.rebuild_and_list_rewritten(source, output)))
+            self.assertEqual([], list(outside.iterdir()))
+
+    def test_unwritable_transcript_cache_does_not_stop_the_build(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "first")
+            cache = output / ".coldvault" / "transcripts.json"
+            cache.unlink()
+            cache.mkdir()
+            (source / "session0.jsonl").write_text(json.dumps({"type": "user", "cwd": "/work/demo0", "message": {"role": "user", "content": "changed"}}), encoding="utf-8")
+            rewritten = self.rebuild_and_list_rewritten(source, output)
+            self.assertEqual(1, len(rewritten))
+            self.assertIn("changed", (output / rewritten[0]).read_text(encoding="utf-8"))
+            self.assertTrue(cache.is_dir())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_build_never_opens_a_named_pipe_at_a_note_path(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "first")
+            session = next((output / "Sessions").glob("*.md"))
+            session.unlink()
+            os.mkfifo(session)
+            self.rebuild_and_list_rewritten(source, output)
+            self.assertFalse(session.is_file())
+            self.assertEqual(1, len(list((output / "Sessions").glob("* (continued).md"))))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_build_never_opens_a_named_pipe_as_its_transcript_cache(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "first")
+            cache = output / ".coldvault" / "transcripts.json"
+            cache.unlink()
+            os.mkfifo(cache)
+            self.assertEqual([], self.rebuild_and_list_rewritten(source, output))
 
     def test_imported_transcripts_redact_credentials(self):
         keys = [
@@ -367,9 +584,9 @@ class VaultKitTests(unittest.TestCase):
         self.assertNotIn("batterystaple", session)
         for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456", "linesecret", "ticksecret", "commasecret", ",secret", "abcdef0123456789"):
             self.assertNotIn(leaked, session)
-        self.assertIn(label + " = " + vault_kit.REDACTED, session)
+        self.assertIn(label + " = " + coldvault.REDACTED, session)
         self.assertIn(kept, session)
-        self.assertIn(label + " =\nplease continue", vault_kit.redact(label + " =\nplease continue"))
+        self.assertIn(label + " =\nplease continue", coldvault.redact(label + " =\nplease continue"))
 
     def test_secret_probe_redacts_bearer_url_password_and_notion_tokens(self):
         email = "user" + "@example.com"
@@ -406,24 +623,131 @@ class VaultKitTests(unittest.TestCase):
             session = next((output / "Sessions").glob("*.md")).read_text(encoding="utf-8")
         leaked = [name for name, value in secrets.items() if value in session]
         self.assertEqual([], leaked)
-        self.assertIn("Authorization: Bearer " + vault_kit.REDACTED, session)
-        self.assertIn("postgres://admin:" + vault_kit.REDACTED + "@db.example.test", session)
-        self.assertIn("https://ops:" + vault_kit.REDACTED + "@host.example.test?email=" + email, session)
+        self.assertIn("Authorization: Bearer " + coldvault.REDACTED, session)
+        self.assertIn("postgres://admin:" + coldvault.REDACTED + "@db.example.test", session)
+        self.assertIn("https://ops:" + coldvault.REDACTED + "@host.example.test?email=" + email, session)
         self.assertIn(kept, session)
 
-    def test_edited_managed_note_is_kept_and_a_copy_is_written(self):
+    def test_edited_managed_note_is_kept_and_linked_without_a_copy(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             source, output = self.build_vault(Path(temporary), "Synthetic")
             note = next((output / "Sessions").glob("*.md"))
             edited = note.read_text(encoding="utf-8") + "\nMy own addition\n"
             note.write_text(edited, encoding="utf-8")
-            with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
-                vault_kit.build(source, output)
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
             self.assertEqual(edited, note.read_text(encoding="utf-8"))
-            copy = next((output / "Sessions").glob("*(Coldvault).md"))
-            self.assertIn("Synthetic", copy.read_text(encoding="utf-8"))
-            self.assertNotIn("My own addition", copy.read_text(encoding="utf-8"))
+            self.assertEqual([note.name], [p.name for p in (output / "Sessions").iterdir()])
+            self.assertIn(f"- [[Sessions/{note.stem}]]", (output / "Projects" / "demo0.md").read_text(encoding="utf-8"))
             self.assertEqual([], list(output.rglob(".coldvault-*")))
+
+    def test_edited_session_note_is_frozen_and_new_messages_go_to_one_continuation(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            source.mkdir()
+            transcript = source / "session.jsonl"
+
+            def say(*texts):
+                with transcript.open("a", encoding="utf-8") as stream:
+                    for text in texts:
+                        stream.write(json.dumps({"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": "/work/demo", "message": {"role": "user", "content": text}}) + "\n")
+                with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                    coldvault.build(source, output)
+
+            say("First question", "First answer")
+            note = next((output / "Sessions").glob("*.md"))
+            mine = note.read_text(encoding="utf-8").replace("First answer", "First answer, which I rewrote") + "\nMy own summary\n"
+            note.write_text(mine, encoding="utf-8")
+            say("Second question")
+            say("Third question")
+
+            self.assertEqual(mine, note.read_text(encoding="utf-8"))
+            self.assertEqual(sorted([note.name, f"{note.stem} (continued).md"]), sorted(p.name for p in (output / "Sessions").iterdir()))
+            continued = (output / "Sessions" / f"{note.stem} (continued).md").read_text(encoding="utf-8")
+            self.assertIn(f"Continues [[Sessions/{note.stem}]]", continued)
+            self.assertIn("Second question\n\nThird question", continued)
+            self.assertNotIn("First", continued)
+            project = (output / "Projects" / "demo.md").read_text(encoding="utf-8")
+            self.assertIn(f"- [[Sessions/{note.stem}]] (2026-02-03) · [[Sessions/{note.stem} (continued)]]", project)
+            self.assertIn(f"[[Sessions/{note.stem}]]", (output / "Daily" / "2026-02-03.md").read_text(encoding="utf-8"))
+            transcript.write_text("".join(transcript.read_text(encoding="utf-8").splitlines(keepends=True)[:2]), encoding="utf-8")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+            self.assertEqual(continued, (output / "Sessions" / f"{note.stem} (continued).md").read_text(encoding="utf-8"))
+            for text in ("First question", "Third question"):
+                self.assertEqual(1, sum(text in p.read_text(encoding="utf-8") for p in (output / "Sessions").iterdir()), text)
+
+    def test_an_edited_session_and_its_continuation_stay_linked_and_untouched_after_the_transcript_is_deleted(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            source.mkdir()
+            transcript = source / "session.jsonl"
+
+            def say(*texts):
+                with transcript.open("a", encoding="utf-8") as stream:
+                    for text in texts:
+                        stream.write(json.dumps({"type": "user", "timestamp": "2026-02-03T10:00:00Z", "cwd": "/work/demo", "message": {"role": "user", "content": text}}) + "\n")
+                build()
+
+            def build():
+                with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                    coldvault.build(source, output)
+
+            say("First question")
+            note = next((output / "Sessions").glob("*.md"))
+            generated = note.read_text(encoding="utf-8")
+            mine = generated + "\nMy own summary\n"
+            note.write_text(mine, encoding="utf-8")
+            say("Second question")
+            continued = note.with_name(f"{note.stem} (continued).md")
+            later = continued.read_text(encoding="utf-8")
+            transcript.unlink()
+            build()
+            self.assertEqual(mine, note.read_text(encoding="utf-8"))
+            self.assertEqual(later, continued.read_text(encoding="utf-8"))
+            self.assertIn("[[Projects/demo]]", (output / "Index.md").read_text(encoding="utf-8"))
+            self.assertIn(f"- [[Sessions/{note.stem}]] (2026-02-03) · [[Sessions/{continued.stem}]]", (output / "Projects" / "demo.md").read_text(encoding="utf-8"))
+            note.write_text(generated, encoding="utf-8")
+            build()
+            self.assertEqual(later, continued.read_text(encoding="utf-8"))
+
+    def test_older_edited_note_without_paragraphs_never_skips_a_new_message(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "First")
+            note = next((output / "Sessions").glob("*.md"))
+            note.write_text(re.sub(r"(?m)^paragraphs: .*\n", "", note.read_text(encoding="utf-8")) + "\nDone\n", encoding="utf-8")
+            with (source / "session0.jsonl").open("a", encoding="utf-8") as stream:
+                for text in ("New question", "Done"):
+                    stream.write("\n" + json.dumps({"type": "user", "cwd": "/work/demo0", "message": {"role": "user", "content": text}}))
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+            continued = note.with_name(f"{note.stem} (continued).md")
+            self.assertEqual(sorted([note.name, continued.name]), sorted(p.name for p in (output / "Sessions").iterdir()))
+            self.assertTrue(continued.read_text(encoding="utf-8").endswith("\n\nNew question\n\nDone\n"))
+
+    def test_old_copy_of_an_edited_session_note_is_retired_and_older_notes_still_continue(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            source, output = self.build_vault(Path(temporary), "Synthetic")
+            note = next((output / "Sessions").glob("*.md"))
+            copy = note.with_name(f"{note.stem} (Coldvault).md")
+            copy.write_text(coldvault._render("old full copy\n"), encoding="utf-8")
+            note.with_name(f"{note.stem} (Coldvault 2).md").write_text(coldvault._render("older full copy\n"), encoding="utf-8")
+            mine = re.sub(r"(?m)^paragraphs: .*$", "paragraphs: 0", note.read_text(encoding="utf-8")) + "\nMy own addition\n"
+            note.write_text(mine, encoding="utf-8")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+            self.assertEqual(mine, note.read_text(encoding="utf-8"))
+            self.assertEqual([note.name], [p.name for p in (output / "Sessions").iterdir()])
+            with (source / "session0.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write("\n" + json.dumps({"type": "user", "cwd": "/work/demo0", "message": {"role": "user", "content": "Later"}}))
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+            continued = note.with_name(f"{note.stem} (continued).md")
+            self.assertEqual(sorted([note.name, continued.name]), sorted(p.name for p in (output / "Sessions").iterdir()))
+            self.assertTrue(continued.read_text(encoding="utf-8").endswith("\n\nLater\n"))
+            self.assertNotIn("Synthetic", continued.read_text(encoding="utf-8"))
 
     def test_notes_vault_kit_cannot_verify_are_kept(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -434,8 +758,8 @@ class VaultKitTests(unittest.TestCase):
             header_edit = original.replace("---\n\n", "tags: mine\n---\n\n", 1)
             for edited in (legacy, header_edit):
                 note.write_text(edited, encoding="utf-8")
-                with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
-                    vault_kit.build(source, output)
+                with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                    coldvault.build(source, output)
                 self.assertEqual(edited, note.read_text(encoding="utf-8"))
 
     def test_search_requires_every_word_and_ranks_the_best_note_first(self):
@@ -445,17 +769,17 @@ class VaultKitTests(unittest.TestCase):
                 captured = io.StringIO()
                 with contextlib.redirect_stdout(captured):
                     if ranked:
-                        found = vault_kit.search(output, "beta alp")
+                        found = coldvault.search(output, "beta alp")
                     else:
-                        with patch.object(vault_kit, "_ranked", return_value=None):
-                            found = vault_kit.search(output, "beta alp")
+                        with patch.object(coldvault, "_ranked", return_value=None):
+                            found = coldvault.search(output, "beta alp")
                 lines = captured.getvalue().splitlines()
                 with contextlib.redirect_stdout(io.StringIO()) as printed:
                     if ranked:
-                        hits = [vault_kit.search(output, w) for w in ("foo-bar baz", "--")]
+                        hits = [coldvault.search(output, w) for w in ("foo-bar baz", "--")]
                     else:
-                        with patch.object(vault_kit, "_ranked", return_value=None):
-                            hits = [vault_kit.search(output, w) for w in ("foo-bar baz", "--")]
+                        with patch.object(coldvault, "_ranked", return_value=None):
+                            hits = [coldvault.search(output, w) for w in ("foo-bar baz", "--")]
                 self.assertEqual([1, 0], hits)
                 self.assertIn("foo bar baz", printed.getvalue())
                 self.assertEqual(2, found)
@@ -464,34 +788,34 @@ class VaultKitTests(unittest.TestCase):
                     self.assertIn("beta alpha beta alpha beta", lines[0])
                 with contextlib.redirect_stdout(io.StringIO()):
                     if ranked:
-                        self.assertEqual([1, 0], [vault_kit.search(output, w) for w in ("cafe", "strasse")])
-                        self.assertEqual(1, vault_kit.search(output, "\u03ba\u03bf\u03c3\u03bc\u03bf\u03c2"))
+                        self.assertEqual([1, 0], [coldvault.search(output, w) for w in ("cafe", "strasse")])
+                        self.assertEqual(1, coldvault.search(output, "\u03ba\u03bf\u03c3\u03bc\u03bf\u03c2"))
                     else:
-                        with patch.object(vault_kit, "_ranked", return_value=None):
-                            self.assertEqual([1, 0], [vault_kit.search(output, w) for w in ("cafe", "strasse")])
+                        with patch.object(coldvault, "_ranked", return_value=None):
+                            self.assertEqual([1, 0], [coldvault.search(output, w) for w in ("cafe", "strasse")])
                 with contextlib.redirect_stdout(io.StringIO()):
                     if ranked:
-                        self.assertEqual(0, vault_kit.search(output, "pha"))
+                        self.assertEqual(0, coldvault.search(output, "pha"))
                     else:
-                        with patch.object(vault_kit, "_ranked", return_value=None):
-                            self.assertEqual(0, vault_kit.search(output, "pha"))
+                        with patch.object(coldvault, "_ranked", return_value=None):
+                            self.assertEqual(0, coldvault.search(output, "pha"))
 
     def test_search_works_without_sqlite(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "alpha beta")
             with patch.dict(sys.modules, {"sqlite3": None}):
-                spec = importlib.util.spec_from_file_location("vault_kit_without_sqlite", vault_kit.__file__)
+                spec = importlib.util.spec_from_file_location("vault_kit_without_sqlite", coldvault.__file__)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(1, module.search(output, "beta alp"))
 
     def run_notes(self, home, *argv):
-        with patch.object(Path, "home", return_value=home), patch.object(sys, "argv", ["vault_kit.py", *argv]), \
+        with patch.object(Path, "home", return_value=home), patch.object(sys, "argv", ["coldvault.py", *argv]), \
                 patch("builtins.input", side_effect=AssertionError("prompted")), \
-                patch.object(vault_kit, "urlopen", side_effect=AssertionError("network called")), \
+                patch.object(coldvault, "urlopen", side_effect=AssertionError("network called")), \
                 contextlib.redirect_stdout(io.StringIO()):
-            vault_kit.main()
+            coldvault.main()
 
     def test_notes_folder_is_imported_linked_searchable_and_idempotent(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -524,21 +848,21 @@ class VaultKitTests(unittest.TestCase):
             self.assertIn("tags: [garden]\n---\n\n# Welcome", welcome)
             self.assertIn("Grow zucchini.\n", (imported / "Projects" / "Plan.md").read_text(encoding="utf-8"))
             for note in imported.rglob("*.md"):
-                self.assertTrue(vault_kit._is_managed_note(note))
+                self.assertTrue(coldvault._is_managed_note(note))
             index = (output / "Index.md").read_text(encoding="utf-8")
             self.assertIn("## Imported notes", index)
             self.assertIn("- [[Imported/My Notes/Projects/Plan]]", index)
             self.assertIn("- [[Imported/My Notes/Welcome]]", index)
             self.assertFalse((output / "Sessions").exists())
             with contextlib.redirect_stdout(io.StringIO()) as printed:
-                self.assertEqual(2, vault_kit.search(output, "zucchini"))
+                self.assertEqual(2, coldvault.search(output, "zucchini"))
                 for hidden in ("gitinternal", "hiddenconfig", "hiddentrash", "hiddenfile", "transcript"):
-                    self.assertEqual(0, vault_kit.search(output, hidden))
+                    self.assertEqual([], [path for path, _, _ in coldvault.hits(output, hidden) if path not in coldvault.VAULT_TEMPLATE])
             self.assertIn("Imported/My Notes/Welcome.md:", printed.getvalue())
 
-            snapshot = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
+            snapshot = notes_and_caches(output)
             self.run_notes(base, "--notes", str(notes), "--output", str(output))
-            self.assertEqual(snapshot, {p: p.read_bytes() for p in output.rglob("*") if p.is_file()})
+            self.assertEqual(snapshot, notes_and_caches(output))
 
     def test_imported_notes_are_redacted(self):
         key = "gh" + "p_" + "Cd4" * 12
@@ -552,7 +876,7 @@ class VaultKitTests(unittest.TestCase):
             note = (base / "vault" / "Imported" / "notes" / "Keys.md").read_text(encoding="utf-8")
         self.assertNotIn(key, note)
         self.assertNotIn("hunter2fixture9", note)
-        self.assertEqual(2, note.count(vault_kit.REDACTED))
+        self.assertEqual(2, note.count(coldvault.REDACTED))
         self.assertIn("kept words", note)
 
     def test_notes_folders_with_the_same_name_stay_separate(self):
@@ -675,6 +999,7 @@ class VaultKitTests(unittest.TestCase):
             for name, data in files.items():
                 archive.writestr(name, data)
 
+    @patch.object(coldvault, "_utc_now", lambda: "2026-03-01T12:00:00Z")
     def test_notion_export_becomes_clean_linked_searchable_notes(self):
         ids, key, files = self.notion_fixture()
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -733,21 +1058,21 @@ class VaultKitTests(unittest.TestCase):
                 self.assertIn("| Short row |  |  |", table)
                 self.assertNotIn("view only", table)
                 self.assertNotIn(key, table)
-                self.assertIn("token: " + vault_kit.REDACTED, table)
+                self.assertIn("token: " + coldvault.REDACTED, table)
                 for note in notion.rglob("*.md"):
-                    self.assertTrue(vault_kit._is_managed_note(note))
+                    self.assertTrue(coldvault._is_managed_note(note))
                 index = (output / "Index.md").read_text(encoding="utf-8")
                 self.assertIn("- [[Imported/Notion/Start/Tasks]]", index)
                 with contextlib.redirect_stdout(io.StringIO()) as printed:
-                    self.assertEqual(1, vault_kit.search(output, "marigold"))
-                    self.assertEqual(0, vault_kit.search(output, "resourcefork"))
+                    self.assertEqual(1, coldvault.search(output, "marigold"))
+                    self.assertEqual(0, coldvault.search(output, "resourcefork"))
                     for skipped in ("zipattachment", "sneakypage", "macstray", "escapedpage"):
-                        self.assertEqual(0, vault_kit.search(output, skipped), skipped)
+                        self.assertEqual(0, coldvault.search(output, skipped), skipped)
                 self.assertTrue(printed.getvalue().startswith("Imported/Notion/Start/Tasks.md:"))
 
-                snapshot = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
+                snapshot = notes_and_caches(output)
                 self.run_notes(base, "--notion-export", str(export), "--output", str(output))
-                self.assertEqual(snapshot, {p: p.read_bytes() for p in output.rglob("*") if p.is_file()})
+                self.assertEqual(snapshot, notes_and_caches(output))
             self.assertEqual(vaults["flat"], vaults["nested"])
             self.assertEqual(vaults["flat"], vaults["unzipped"])
 
@@ -815,7 +1140,7 @@ class VaultKitTests(unittest.TestCase):
             self.assertIn("# hiddenwrite", (notion / "obsidian" / "workspace.md").read_text(encoding="utf-8"))
             outside = [path for path in output.rglob("*.md") if notion not in path.parents and "# escapee" in path.read_text(encoding="utf-8")]
             self.assertEqual([], outside)
-            self.assertEqual([], list(output.rglob(".*")))
+            self.assertEqual([output / ".obsidian"], [p for p in output.rglob(".*") if ".coldvault" not in p.relative_to(output).parts])
             self.assertIn("| row | [[Imported/Notion/Keys\\|keys]] |", texts["Rel.md"])
             self.assertIn("row | [[Imported/Notion/Keys\\|cell]]\nAfter [[Imported/Notion/Keys|after]] and [[Imported/Notion/Folder (one (two))/Deep|deep]]\n", texts["Code.md"])
             self.assertIn("| alone |", texts["D.md"])
@@ -823,7 +1148,7 @@ class VaultKitTests(unittest.TestCase):
             self.assertIn("[[Imported/Notion/D_all|D all]]", texts["Uses D.md"])
             self.assertEqual(["# A eight", "# A one", "# A two"], sorted(text.split("---\n\n")[1].strip() for name, text in texts.items() if name.startswith("A ")))
             self.assertIn("| north |", texts["Sales_all.md"])
-            self.assertIn("| api_key=" + vault_kit.REDACTED + " | second |", texts["Keys.md"])
+            self.assertIn("| api_key=" + coldvault.REDACTED + " | second |", texts["Keys.md"])
             self.assertNotIn("foo", texts["Keys.md"])
             self.assertIn("```\n[example](missing.md)\n```not-a-closing-fence\n[still code](Keys.csv)\n```\n\n"
                           "[bad](https://[bad/path) and inline `[x](missing.md)`, ``a ` [y](Keys.csv) ` b`` and [[Imported/Notion/Keys|real]]", texts["Code.md"])
@@ -851,7 +1176,7 @@ class VaultKitTests(unittest.TestCase):
         if not words:
             return 0, ""
         query = " ".join('"' + scan_fold(word).replace('"', '""') + '"*' for word in words)
-        with contextlib.closing(vault_kit.sqlite3.connect(":memory:")) as database:
+        with contextlib.closing(coldvault.sqlite3.connect(":memory:")) as database:
             database.execute("CREATE VIRTUAL TABLE notes USING fts5(path UNINDEXED, body)")
             database.executemany("INSERT INTO notes VALUES (?, ?)", ((path, scan_fold(text)) for path, text in notes.items()))
             ranked = [path for (path,) in database.execute("SELECT path FROM notes WHERE notes MATCH ? ORDER BY bm25(notes), path", (query,))]
@@ -861,7 +1186,7 @@ class VaultKitTests(unittest.TestCase):
 
     def kit_search(self, vault, term):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
-            found = vault_kit.search(vault, term)
+            found = coldvault.search(vault, term)
         return found, printed.getvalue()
 
     def assert_same_results(self, vault, queries):
@@ -915,6 +1240,7 @@ class VaultKitTests(unittest.TestCase):
     def test_search_index_is_gitignored_and_never_changes_notes(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "alpha beta", "beta gamma")
+            shutil.rmtree(output / ".coldvault")
             notes = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
             self.kit_search(output, "beta")
             self.assertEqual("*\n", (output / ".coldvault" / ".gitignore").read_text(encoding="utf-8"))
@@ -929,6 +1255,7 @@ class VaultKitTests(unittest.TestCase):
     def test_search_index_of_an_unwritable_vault_goes_to_the_cache(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             _, output = self.build_vault(Path(temporary), "alpha beta", "beta gamma")
+            shutil.rmtree(output / ".coldvault")
             (output / ".coldvault").write_text("not a folder", encoding="utf-8")
             files = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
             cache = Path(temporary) / "cache"
@@ -940,7 +1267,7 @@ class VaultKitTests(unittest.TestCase):
 
     def test_search_index_never_writes_through_symlinks_or_into_foreign_databases(self):
         def foreign_database(path):
-            with contextlib.closing(vault_kit.sqlite3.connect(str(path))) as database:
+            with contextlib.closing(coldvault.sqlite3.connect(str(path))) as database:
                 database.execute("CREATE TABLE notes(body TEXT)")
                 database.execute("INSERT INTO notes VALUES ('irreplaceable synthetic record')")
                 database.commit()
@@ -977,6 +1304,7 @@ class VaultKitTests(unittest.TestCase):
             with self.subTest(setup.__name__), tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
                 base = Path(temporary)
                 _, vault = self.build_vault(base, f"alpha {needle}", "beta gamma")
+                shutil.rmtree(vault / ".coldvault")
                 outside, cache = base / "outside", base / "cache"
                 outside.mkdir()
                 setup(vault, outside, cache)
@@ -989,9 +1317,127 @@ class VaultKitTests(unittest.TestCase):
                 self.assertEqual(sorted(p for p in existing if outside in p.parents),
                                  sorted(p for p in outside.rglob("*") if p.is_file()))
 
+def chatgpt_conversation(conversation_id, title, user, assistant, created=1767225600.0):
+    def node(key, role, text, offset, content_type="text", metadata=None, **extra):
+        return key, {"id": key, "message": {"id": key, "author": {"role": role}, "create_time": created + offset,
+                                            "content": {"content_type": content_type, "parts": [text]}, "metadata": metadata or {}, **extra}}
+    return {"id": conversation_id, "conversation_id": conversation_id, "title": title, "create_time": created, "mapping": dict([
+        node(conversation_id + "-a", "assistant", assistant, 3),
+        node(conversation_id + "-s", "system", "hidden system prompt", 0),
+        node(conversation_id + "-u", "user", user, 1),
+        node(conversation_id + "-t", "tool", "tool output text", 2),
+        node(conversation_id + "-h", "user", "hidden context text", 0.5, metadata={"is_visually_hidden_from_conversation": True}),
+        node(conversation_id + "-c", "assistant", "tool call text", 1.5, recipient="python"),
+        node(conversation_id + "-r", "assistant", "analysis channel text", 1.7, channel="analysis"),
+        (conversation_id + "-root", {"id": conversation_id + "-root", "message": None}),
+    ])}
+
+
+def claude_conversation(conversation_id, name, user, assistant):
+    return {"uuid": conversation_id, "name": name, "created_at": "2026-01-01T09:00:00.000000Z", "chat_messages": [
+        {"uuid": conversation_id + "-u", "sender": "human", "text": user, "content": [{"type": "text", "text": user}]},
+        {"uuid": conversation_id + "-a", "sender": "assistant", "text": "legacy flattened text", "content": [
+            {"type": "thinking", "thinking": "private reasoning text"}, {"type": "text", "text": assistant},
+            {"type": "tool_result", "content": "tool output text"}]},
+    ]}
+
+
+def branched_chatgpt_conversation(conversation_id, title, user, discarded, kept, created=1767225600.0):
+    def node(key, parent, role, text):
+        message = None if role is None else {"id": key, "author": {"role": role}, "create_time": created,
+                                             "content": {"content_type": "text", "parts": [text]}}
+        return key, {"id": key, "parent": parent, "message": message}
+    return {"id": conversation_id, "title": title, "create_time": created, "current_node": "kept", "mapping": dict([
+        node("kept", "question", "assistant", kept), node("discarded", "question", "assistant", discarded),
+        node("question", "root", "user", user), node("root", None, None, ""),
+    ])}
+
+
+def write_export(path, conversations, split=False):
+    with zipfile.ZipFile(path, "w") as archive:
+        if split:
+            for number, conversation in enumerate(conversations):
+                archive.writestr(f"conversations-{number:03d}.json", json.dumps([conversation]))
+        else:
+            archive.writestr("conversations.json", json.dumps(conversations))
+        archive.writestr("user.json", "{}")
+    return path
+
+
+class ChatExportTests(unittest.TestCase):
+    def run_kit(self, home, *argv):
+        with patch.object(Path, "home", return_value=home), patch.object(sys, "argv", ["coldvault.py", *argv]), \
+                patch("builtins.input", side_effect=AssertionError("prompted")), \
+                patch.object(coldvault, "urlopen", side_effect=AssertionError("network called")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            coldvault.main()
+
+    def test_exports_become_one_session_note_per_conversation_and_reruns_add_only_new_ones(self):
+        secret = "sk-proj-" + "a" * 24
+        first = [chatgpt_conversation("c1", "Garden plan", f"Plan my garden, key {secret}", "Plant tomatoes"),
+                 branched_chatgpt_conversation("c2", "Bread", "How do I bake bread", "Discarded answer", "Use flour")]
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            chatgpt = write_export(base / "chatgpt.zip", first, split=True)
+            claude = write_export(base / "claude.zip", [claude_conversation("k1", "Trip notes", "Pack for a trip", "Bring boots")])
+            output = base / "vault"
+            argv = ("--chatgpt-export", str(chatgpt), "--claude-export", str(claude), "--output", str(output))
+            self.run_kit(base, *argv)
+            sessions = sorted((output / "Sessions").glob("*.md"))
+            self.assertEqual(3, len(sessions))
+            text = "\n".join(path.read_text(encoding="utf-8") for path in sessions)
+            for expected in ("Plan my garden", "Plant tomatoes", "## Garden plan", "Use flour", "Pack for a trip", "Bring boots",
+                             "source: chatgpt", "source: claude-ai", 'session-id: "k1"', "date: 2026-01-01", coldvault.REDACTED):
+                self.assertIn(expected, text)
+            for hidden in (secret, "tool output text", "hidden system prompt", "hidden context text", "private reasoning text",
+                           "tool call text", "analysis channel text", "legacy flattened text", "Discarded answer"):
+                self.assertNotIn(hidden, text)
+            self.assertIn("[[Sessions/", (output / "Projects" / "chatgpt.md").read_text(encoding="utf-8"))
+            self.assertIn("[[Sessions/", (output / "Projects" / "claude-ai.md").read_text(encoding="utf-8"))
+            receipt = json.loads((output / ".coldvault" / "last-run.json").read_text(encoding="utf-8"))
+            self.assertEqual({"state": "ok", "count": 3}, receipt["sources"]["chat-exports"])
+
+            before = notes_and_caches(output)
+            self.run_kit(base, *argv)
+            self.assertEqual(before, notes_and_caches(output))
+
+            newer = write_export(base / "chatgpt-newer.zip", [*first, chatgpt_conversation("c3", "Bikes", "Fix a flat tyre", "Patch the tube")])
+            self.run_kit(base, "--chatgpt-export", str(newer), "--claude-export", str(claude), "--output", str(output))
+            notes = {path for path in output.rglob("*.md")}
+            added = notes - {path for path in before if path.suffix == ".md"}
+            self.assertEqual(1, len(added))
+            self.assertEqual("Sessions", added.pop().parent.name)
+            self.assertEqual(4, len(list((output / "Sessions").glob("*.md"))))
+
+    def test_export_that_is_not_a_chat_export_zip_is_refused(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            (base / "plain.zip").write_text("not a zip", encoding="utf-8")
+            for flag in ("--chatgpt-export", "--claude-export"):
+                for export in (base / "plain.zip", base / "missing.zip"):
+                    with self.subTest(flag=flag, export=export.name), self.assertRaises(SystemExit) as raised:
+                        self.run_kit(base, flag, str(export), "--output", str(base / "vault"))
+                    self.assertEqual(2, raised.exception.code)
+            self.assertFalse((base / "vault" / "Index.md").exists())
+            empty = base / "empty.zip"
+            with zipfile.ZipFile(empty, "w") as archive:
+                archive.writestr("readme.txt", "no conversations")
+            broken = write_export(base / "broken.zip", [{"uuid": "k1", "chat_messages": "not a list"}])
+            for flag, export in (("--chatgpt-export", empty), ("--claude-export", broken), ("--chatgpt-export", write_export(base / "noid.zip", [{"mapping": {}}])),
+                                 ("--chatgpt-export", write_export(base / "nomapping.zip", [{"id": "c1"}])),
+                                 ("--chatgpt-export", write_export(base / "badnode.zip", [{**branched_chatgpt_conversation("c1", "T", "q", "old", "new"), "current_node": "missing"}])),
+                                 ("--chatgpt-export", write_export(base / "stringparts.zip", [{"id": "c1", "mapping": {"m": {"message": {
+                                     "author": {"role": "user"}, "content": {"content_type": "text", "parts": "hello"}}}}}]))):
+                with self.subTest(export=export.name), self.assertRaises(SystemExit) as raised:
+                    self.run_kit(base, flag, str(export), "--output", str(base / "vault"))
+                self.assertEqual(3, raised.exception.code)
+                receipt = json.loads((base / "vault" / ".coldvault" / "last-run.json").read_text(encoding="utf-8"))
+                self.assertEqual("failed", receipt["sources"]["chat-exports"]["state"])
+
+
 class CommandLineErrorTests(unittest.TestCase):
     def cli(self, home, *argv):
-        script = Path(vault_kit.__file__).resolve()
+        script = Path(coldvault.__file__).resolve()
         result = subprocess.run(
             [sys.executable, str(script), *argv], stdin=subprocess.DEVNULL, capture_output=True, text=True,
             env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)}, timeout=60,
@@ -1037,7 +1483,7 @@ class CommandLineErrorTests(unittest.TestCase):
             cases = (
                 (("--transcripts", str(base / "nope")), "transcript folder not found"),
                 (("--transcripts", str(base / "empty")), "no transcripts (*.jsonl) found in"),
-                ((), "no transcripts found in ~/.claude/projects or ~/.codex/sessions"),
+                ((), "no transcripts found in ~/.claude/projects, ~/.codex/sessions or ~/.codex/archived_sessions"),
             )
             for argv, message in cases:
                 with self.subTest(argv=argv):
@@ -1051,18 +1497,18 @@ class CommandLineErrorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             result = self.cli(Path(temporary), "--version")
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertRegex(vault_kit.__version__, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(f"coldvault {vault_kit.__version__}\n", result.stdout)
+        self.assertRegex(coldvault.__version__, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(f"coldvault {coldvault.__version__}\n", result.stdout)
 
 
 class PackagingTests(unittest.TestCase):
     def test_package_installs_a_coldvault_command_with_the_module_version(self):
-        pyproject = (Path(vault_kit.__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
+        pyproject = (Path(coldvault.__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
         self.assertRegex(pyproject, r'(?m)^name = "coldvault"$')
         self.assertRegex(pyproject, r'(?m)^dynamic = \["version"\]$')
-        self.assertRegex(pyproject, r'(?m)^version = \{attr = "vault_kit.__version__"\}$')
-        self.assertRegex(pyproject, r'(?m)^py-modules = \["vault_kit"\]$')
-        self.assertRegex(pyproject, r'(?ms)^\[project\.scripts\]\ncoldvault = "vault_kit:main"$')
+        self.assertRegex(pyproject, r'(?m)^version = \{attr = "coldvault.__version__"\}$')
+        self.assertRegex(pyproject, r'(?m)^py-modules = \["coldvault", "vault_kit"\]$')
+        self.assertRegex(pyproject, r'(?ms)^\[project\.scripts\]\ncoldvault = "coldvault:main"$')
 
 
 class ManagedMarkerTests(unittest.TestCase):
@@ -1073,8 +1519,8 @@ class ManagedMarkerTests(unittest.TestCase):
         return "\n".join(lines)
 
     def rebuild(self, source, output):
-        with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
-            vault_kit.build(source, output)
+        with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            coldvault.build(source, output)
 
     def test_new_notes_use_the_coldvault_marker(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -1084,8 +1530,10 @@ class ManagedMarkerTests(unittest.TestCase):
             record = {"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
             (source / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
             self.rebuild(source, output)
-            notes = list(output.rglob("*.md"))
+            notes = [note for note in output.rglob("*.md") if note.relative_to(output).as_posix() not in coldvault.VAULT_TEMPLATE]
             self.assertTrue(notes)
+            for name in coldvault.VAULT_TEMPLATE:
+                self.assertFalse(coldvault._is_managed_note(output / name), name)
             for note in notes:
                 text = note.read_text(encoding="utf-8")
                 self.assertTrue(text.startswith("---\ncoldvault-managed: true\ncoldvault-hash: "), note)
@@ -1105,7 +1553,7 @@ class ManagedMarkerTests(unittest.TestCase):
             old_copy = output / "Index (Vault Kit).md"
             for note in (session, old_copy):
                 note.write_text(self.legacy_note("stale generated content\n"), encoding="utf-8")
-                self.assertTrue(vault_kit._is_managed_note(note))
+                self.assertTrue(coldvault._is_managed_note(note))
             (output / "Index (Coldvault).md").unlink(missing_ok=True)
 
             self.rebuild(source, output)
@@ -1115,11 +1563,160 @@ class ManagedMarkerTests(unittest.TestCase):
                 text = note.read_text(encoding="utf-8")
                 self.assertTrue(text.startswith("---\ncoldvault-managed: true\ncoldvault-hash: "), note)
                 self.assertNotIn("stale generated content", text)
-                self.assertTrue(vault_kit._is_managed_note(note))
+                self.assertTrue(coldvault._is_managed_note(note))
             self.assertIn("Synthetic", session.read_text(encoding="utf-8"))
             self.assertEqual([session], list((output / "Sessions").glob("*.md")))
             self.assertFalse((output / "Index (Coldvault).md").exists())
             self.assertIn("[[Index (Vault Kit)]]", (output / "START-HERE.md").read_text(encoding="utf-8"))
+
+    def frontmatter(self, note):
+        lines = note.read_text(encoding="utf-8").split("\n")
+        fields = {}
+        for line in lines[1:lines.index("---", 1)]:
+            key, value = line.split(": ", 1)
+            fields[key] = json.loads(value) if value.startswith('"') else value
+        return fields
+
+    def test_generated_notes_carry_source_metadata_and_keep_a_valid_hash(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, output = base / "input", base / "vault"
+            (source / "claude").mkdir(parents=True)
+            (source / "codex").mkdir()
+            claude = [
+                {"type": "user", "sessionId": "claude-session-1", "timestamp": "2026-02-03T10:00:00Z", "cwd": "/work/demo: two", "message": {"role": "user", "content": "Claude question"}},
+            ]
+            codex = [
+                {"type": "session_meta", "timestamp": "2026-02-04T10:00:00Z", "payload": {"id": "codex-session-1", "cwd": "/work/other"}},
+                {"type": "response_item", "timestamp": "2026-02-04T10:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Codex question"}]}},
+            ]
+            (source / "claude" / "a.jsonl").write_text("\n".join(map(json.dumps, claude)), encoding="utf-8")
+            (source / "codex" / "rollout.jsonl").write_text("\n".join(map(json.dumps, codex)), encoding="utf-8")
+            (source / "odd").mkdir()
+            (source / "odd" / "b.jsonl").write_text(json.dumps({"type": "user", "sessionId": "odd-session", "timestamp": "2026-99-99T10:00:00Z", "cwd": "/work/odd", "message": {"role": "user", "content": "Odd question"}}), encoding="utf-8")
+            repo = {"name": "other", "full_name": "synthetic-user/other", "html_url": "https://github.com/synthetic-user/other", "pushed_at": "2026-02-05T09:00:00Z"}
+
+            def build():
+                with patch.object(coldvault, "github_repos", return_value=[repo]), contextlib.redirect_stdout(io.StringIO()), \
+                        patch.object(coldvault, "urlopen", side_effect=HTTPError("https://api.github.com/", 404, "Not Found", {}, None)):
+                    coldvault.build(source, output, "synthetic-user")
+
+            build()
+            sessions = {self.frontmatter(note).get("session-id"): note for note in (output / "Sessions").glob("*.md")}
+            self.assertEqual({"claude-session-1", "codex-session-1", "odd-session"}, set(sessions))
+            self.assertIn('\ndate: "2026-99-99"\n', sessions["odd-session"].read_text(encoding="utf-8"))
+            self.assertIn('\ndate: 2026-02-03\n', sessions["claude-session-1"].read_text(encoding="utf-8"))
+            claude_meta = self.frontmatter(sessions["claude-session-1"])
+            codex_meta = self.frontmatter(sessions["codex-session-1"])
+            self.assertEqual(("claude-code", "2026-02-03", "demo: two"), (claude_meta["source"], claude_meta["date"], claude_meta["project"]))
+            self.assertEqual(("codex", "2026-02-04", "other"), (codex_meta["source"], codex_meta["date"], codex_meta["project"]))
+            for meta in (claude_meta, codex_meta):
+                self.assertRegex(meta["imported-at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            github = self.frontmatter(output / "Projects" / "other.md")
+            self.assertEqual(("synthetic-user/other", "2026-02-05T09:00:00Z"), (github["repo"], github["pushed-at"]))
+            for note in [*sessions.values(), output / "Projects" / "other.md"]:
+                self.assertTrue(coldvault._is_managed_note(note), note)
+
+            session = sessions["claude-session-1"]
+            unhashed = f"---\ncoldvault-managed: true\n---\n\n# demo: two — 2026-02-03\n\nold body\n"
+            lines = unhashed.split("\n")
+            lines.insert(2, "coldvault-hash: " + hashlib.sha256(unhashed.encode("utf-8")).hexdigest())
+            session.write_text("\n".join(lines), encoding="utf-8")
+            self.assertTrue(coldvault._is_managed_note(session))
+            build()
+            self.assertEqual(sorted(sessions.values()), sorted((output / "Sessions").glob("*.md")))
+            self.assertEqual("claude-session-1", self.frontmatter(session)["session-id"])
+            self.assertIn("Claude question", session.read_text(encoding="utf-8"))
+
+            first = {note: note.read_text(encoding="utf-8") for note in output.rglob("*.md")}
+            build()
+            self.assertEqual(first, {note: note.read_text(encoding="utf-8") for note in output.rglob("*.md")})
+
+            for bad in ("2026-99-99T99:99:99Z", "2026-02-05 09:00:00", None):
+                with self.subTest(pushed_at=bad):
+                    repo["pushed_at"] = bad
+                    build()
+                    github = self.frontmatter(output / "Projects" / "other.md")
+                    self.assertEqual("synthetic-user/other", github["repo"])
+                    self.assertNotIn("pushed-at", github)
+            repo["pushed_at"] = "2026-02-05T09:00:00Z"
+            build()
+            self.assertEqual(first, {note: note.read_text(encoding="utf-8") for note in output.rglob("*.md")})
+
+    def test_daily_notes_list_each_days_sessions_and_imported_notes_and_reruns_change_nothing(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            source, notes, output = base / "input", base / "notes", base / "vault"
+            source.mkdir()
+            notes.mkdir()
+            for name, stamp, cwd in (("a", "2026-02-03T10:00:00Z", "/work/alpha"), ("b", "2026-02-03T23:00:00Z", "/work/beta"), ("c", "2026-02-04T09:00:00Z", "/work/alpha"), ("d", None, "/work/alpha")):
+                record = {"type": "user", "cwd": cwd, "message": {"role": "user", "content": f"Question {name}"}}
+                if stamp:
+                    record["timestamp"] = stamp
+                (source / f"{name}.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            (notes / "Plan.md").write_text("# Plan\n", encoding="utf-8")
+            (notes / "Tagged.md").write_text("---\ntags: [garden]\n---\n\n# Tagged\n", encoding="utf-8")
+            (notes / "Stamped.md").write_text('---\nimported-at: "2025-12-31T08:00:00Z"\n---\n\n# Stamped\n', encoding="utf-8")
+
+            def build(now):
+                with patch.object(coldvault, "github_repos", return_value=[]), patch.object(coldvault, "_utc_now", return_value=now), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    coldvault.build_from_files(sorted(source.glob("*.jsonl")), output, "", [notes])
+
+            build("2026-03-01T12:00:00Z")
+            daily = output / "Daily"
+            self.assertEqual(["2025-12-31.md", "2026-02-03.md", "2026-02-04.md", "2026-03-01.md", "README.md"], sorted(p.name for p in daily.iterdir()))
+            sessions = {self.frontmatter(note)["session-id"]: note.relative_to(output).as_posix().removesuffix(".md") for note in (output / "Sessions").glob("*.md")}
+            first = (daily / "2026-02-03.md").read_text(encoding="utf-8")
+            self.assertEqual({"record_type": "daily_index", "date": "2026-02-03"}, {k: v for k, v in self.frontmatter(daily / "2026-02-03.md").items() if not k.startswith("coldvault-")})
+            self.assertIn(f"## Sessions\n\n- [[{sessions['a']}]] · [[Projects/alpha]]\n- [[{sessions['b']}]] · [[Projects/beta]]", first)
+            self.assertNotIn("## Imported notes", first)
+            self.assertIn(f"- [[{sessions['c']}]] · [[Projects/alpha]]", (daily / "2026-02-04.md").read_text(encoding="utf-8"))
+            imported = (daily / "2026-03-01.md").read_text(encoding="utf-8")
+            self.assertIn("## Imported notes\n\n- [[Imported/notes/Plan]]\n- [[Imported/notes/Tagged]]", imported)
+            self.assertNotIn("## Sessions", imported)
+            self.assertIn("- [[Imported/notes/Stamped]]", (daily / "2025-12-31.md").read_text(encoding="utf-8"))
+            self.assertNotIn(sessions["d"], "".join(p.read_text(encoding="utf-8") for p in daily.glob("*.md")))
+            self.assertEqual("2026-03-01T12:00:00Z", self.frontmatter(output / "Imported" / "notes" / "Tagged.md")["imported-at"])
+            self.assertEqual("[garden]", self.frontmatter(output / "Imported" / "notes" / "Tagged.md")["tags"])
+            for note in [*daily.glob("20*.md"), *(output / "Imported").rglob("*.md")]:
+                self.assertTrue(coldvault._is_managed_note(note), note)
+
+            snapshot = notes_and_caches(output)
+            build("2026-03-02T12:00:00Z")
+            self.assertEqual(snapshot, notes_and_caches(output))
+
+            (daily / "2026-02-04.md").write_text("# My own day\n", encoding="utf-8")
+            (notes / "Later.md").write_text("# Later\n", encoding="utf-8")
+            (output / "Imported" / "notes" / "Later.md").write_text("---\nimported-at: 2020-01-01T00:00:00Z\n---\n\n# My unrelated note\n", encoding="utf-8")
+            build("2026-03-02T12:00:00Z")
+            self.assertEqual("# My own day\n", (daily / "2026-02-04.md").read_text(encoding="utf-8"))
+            self.assertIn(f"- [[{sessions['c']}]]", (daily / "2026-02-04 (Coldvault).md").read_text(encoding="utf-8"))
+            self.assertIn("- [[Imported/notes/Later (Coldvault)]]", (daily / "2026-03-02.md").read_text(encoding="utf-8"))
+            self.assertFalse((daily / "2020-01-01.md").exists())
+            self.assertNotIn("Later", (daily / "2026-03-01.md").read_text(encoding="utf-8"))
+
+            tagged = output / "Imported" / "notes" / "Tagged.md"
+            tagged.write_text(tagged.read_text(encoding="utf-8") + "\nMy edit\n", encoding="utf-8")
+            (notes / "Plan.md").unlink()
+            (source / "a.jsonl").unlink()
+            build("2026-03-03T12:00:00Z")
+            self.assertIn("My edit", tagged.read_text(encoding="utf-8"))
+            self.assertEqual("2026-03-01T12:00:00Z", self.frontmatter(output / "Imported" / "notes" / "Tagged (Coldvault).md")["imported-at"])
+            self.assertIn("- [[Imported/notes/Tagged (Coldvault)]]", (daily / "2026-03-01.md").read_text(encoding="utf-8"))
+            self.assertNotIn("Plan", (daily / "2026-03-01.md").read_text(encoding="utf-8"))
+            self.assertFalse((daily / "2026-03-03.md").exists())
+            self.assertNotIn(sessions["a"], (daily / "2026-02-03.md").read_text(encoding="utf-8"))
+            (source / "b.jsonl").unlink()
+            build("2026-03-03T12:00:00Z")
+            self.assertFalse((daily / "2026-02-03.md").exists())
+            self.assertEqual("# My own day\n", (daily / "2026-02-04.md").read_text(encoding="utf-8"))
+            self.assertTrue((daily / "2026-02-04 (Coldvault).md").exists())
+            self.assertTrue((daily / "README.md").exists())
+
+            other = coldvault.write_note(output, "Daily/2026-01-01.md", "# A managed note that is not a daily index\n")
+            build("2026-03-03T12:00:00Z")
+            self.assertTrue((output / other).exists())
 
     def test_edited_or_mixed_marker_notes_are_not_managed(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -1134,9 +1731,9 @@ class ManagedMarkerTests(unittest.TestCase):
             for name, text in cases.items():
                 with self.subTest(name):
                     note.write_text(text, encoding="utf-8")
-                    self.assertFalse(vault_kit._is_managed_note(note))
+                    self.assertFalse(coldvault._is_managed_note(note))
             note.write_text(legacy, encoding="utf-8")
-            self.assertTrue(vault_kit._is_managed_note(note))
+            self.assertTrue(coldvault._is_managed_note(note))
 
     def test_a_kept_old_copy_gets_a_coldvault_copy_beside_it(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -1183,8 +1780,8 @@ class IdentityTests(unittest.TestCase):
             path.write_text(json.dumps(record), encoding="utf-8")
 
     def rebuild(self, source, output):
-        with patch.object(vault_kit, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
-            vault_kit.build(source, output)
+        with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            coldvault.build(source, output)
 
     def test_copied_transcript_tree_keeps_the_session_count(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
@@ -1240,10 +1837,10 @@ class IdentityTests(unittest.TestCase):
             ])
             legacy = {}
             for folder, project in (("a", "app"), ("b", "app"), ("c", "kept")):
-                key = vault_kit.hashlib.sha1(str((source / folder / "session.jsonl").resolve()).encode()).hexdigest()[:8]
+                key = coldvault.hashlib.sha1(str((source / folder / "session.jsonl").resolve()).encode()).hexdigest()[:8]
                 legacy[folder] = f"Sessions/2026-11-01-{project}-{key}.md"
-                vault_kit.write_note(output, legacy[folder], f"# {project} — 2026-11-01\n\nProject: [[Projects/{project}]]\n\nold text")
-            vault_kit.write_note(output, "Projects/app.md", "# app\n\n## Sessions\n\n" + "\n".join(f"- {vault_kit.link(legacy[f])} (2026-11-01)" for f in "ab"))
+                coldvault.write_note(output, legacy[folder], f"# {project} — 2026-11-01\n\nProject: [[Projects/{project}]]\n\nold text")
+            coldvault.write_note(output, "Projects/app.md", "# app\n\n## Sessions\n\n" + "\n".join(f"- {coldvault.link(legacy[f])} (2026-11-01)" for f in "ab"))
             edited = (output / legacy["c"]).read_text(encoding="utf-8") + "\nMy own addition\n"
             (output / legacy["c"]).write_text(edited, encoding="utf-8")
 
@@ -1259,7 +1856,7 @@ class IdentityTests(unittest.TestCase):
             linked = "\n".join(p.read_text(encoding="utf-8") for p in (output / "Projects").glob("*.md"))
             for note in sessions:
                 if note != legacy["c"]:
-                    self.assertIn(vault_kit.link(note), linked)
+                    self.assertIn(coldvault.link(note), linked)
             for text in ("claude two app", "claude three app", "edited session"):
                 self.assertEqual(1, sum(text in (output / note).read_text(encoding="utf-8") for note in sessions if note != legacy["c"]))
 
@@ -1268,11 +1865,19 @@ class IdentityTests(unittest.TestCase):
 KIT = Path(__file__).resolve().parents[1]
 
 
+class ChangelogTests(unittest.TestCase):
+    def test_latest_entry_is_the_current_version(self):
+        changelog = (KIT / "CHANGELOG.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^## (\S+)", changelog, re.M)
+        self.assertEqual(headings[:1], [coldvault.__version__])
+
+
 class ReadmeTests(unittest.TestCase):
     def setUp(self):
         self.readme = (KIT / "README.md").read_text(encoding="utf-8")
         self.lines = self.readme.splitlines()
         self.commands = [line[4:] for line in self.lines if line.startswith("    ")]
+        self.customize = (KIT / "docs" / "customize.md").read_text(encoding="utf-8")
 
     def section(self, heading):
         self.assertTrue(heading in self.lines, f"README has no {heading!r} heading")
@@ -1281,19 +1886,38 @@ class ReadmeTests(unittest.TestCase):
         return self.lines[start:end]
 
     def scheduled(self):
-        cron = [command for command in self.commands if command.startswith("0 * * * * ")]
+        commands = [line[4:] for line in self.customize.splitlines() if line.startswith("    ")]
+        cron = [command for command in commands if command.startswith("0 * * * * ")]
         self.assertEqual(1, len(cron), cron)
-        start = self.commands.index("cat > ~/Library/LaunchAgents/coldvault.rebuild.plist <<'EOF'")
-        end = self.commands.index("EOF", start)
-        plist = plistlib.loads("\n".join(self.commands[start + 1:end]).encode("utf-8"))
-        return cron[0][len("0 * * * * "):], plist, self.commands[end + 1]
+        start = commands.index("cat > ~/Library/LaunchAgents/coldvault.rebuild.plist <<'EOF'")
+        end = commands.index("EOF", start)
+        plist = plistlib.loads("\n".join(commands[start + 1:end]).encode("utf-8"))
+        return cron[0][len("0 * * * * "):], plist, commands[end + 1]
 
     def test_quickstart_downloads_the_script_with_curl_before_any_git_step(self):
-        curl = f"curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/{Path(vault_kit.__file__).name}"
+        curl = f"curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/{Path(coldvault.__file__).name}"
         self.assertIn(curl, self.commands)
         first_git = next(i for i, command in enumerate(self.commands) if command.startswith("git "))
         self.assertLess(self.commands.index(curl), first_git)
         self.assertEqual("mkdir -p ~/coldvault && cd ~/coldvault", self.commands[self.commands.index(curl) - 1])
+
+    def test_main_path_is_install_setup_obsidian_schedule_status_in_800_words(self):
+        path = ["## Install", "## Set up", "## Open it in Obsidian", "## Schedule", "## Check that it is working"]
+        headings = [line for line in self.lines if line.startswith("## ")]
+        self.assertEqual(path, headings[:len(path)])
+        start = self.lines.index(path[0])
+        end = self.lines.index(headings[len(path)])
+        main = "\n".join(self.lines[start:end])
+        self.assertLessEqual(len(main.split()), 800)
+        self.assertIn("    python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault", main)
+        self.assertNotIn("notion-sync", main)
+        self.assertNotIn("rclone", main)
+
+    def test_readme_links_the_moved_guides(self):
+        for guide in ("docs/sources.md", "docs/sync.md", "docs/vault.md", "docs/customize.md#schedule"):
+            self.assertIn(f"]({guide})", self.readme)
+        for target in re.findall(r"\]\((docs/[^)#]+)", self.readme):
+            self.assertTrue((KIT / target).is_file(), target)
 
     def test_readme_says_how_to_open_the_vault_in_obsidian(self):
         self.assertIn("choose **Open folder as vault**", "\n".join(self.section("## Open it in Obsidian")))
@@ -1305,7 +1929,7 @@ class ReadmeTests(unittest.TestCase):
         self.assertEqual(3600, plist["StartInterval"])
         self.assertEqual("launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/coldvault.rebuild.plist", load)
         for verb in ("kickstart", "bootout"):
-            self.assertIn(f"`launchctl {verb} gui/$(id -u)/{plist['Label']}`", self.readme)
+            self.assertIn(f"`launchctl {verb} gui/$(id -u)/{plist['Label']}`", self.customize)
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("python3"), "the scheduled line runs python3 under /bin/sh")
     def test_scheduled_command_builds_the_vault_without_a_terminal(self):
@@ -1313,7 +1937,7 @@ class ReadmeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             home = Path(temporary)
             (home / "coldvault").mkdir()
-            shutil.copy2(KIT / "vault_kit.py", home / "coldvault" / "vault_kit.py")
+            shutil.copy2(KIT / "coldvault.py", home / "coldvault" / "coldvault.py")
             env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
             def run():
@@ -1324,7 +1948,7 @@ class ReadmeTests(unittest.TestCase):
 
             missing = run()
             self.assertEqual(2, missing.returncode, missing.stderr)
-            self.assertIn("no transcripts found in ~/.claude/projects or ~/.codex/sessions", missing.stderr)
+            self.assertIn("no transcripts found in ~/.claude/projects, ~/.codex/sessions or ~/.codex/archived_sessions", missing.stderr)
             vault = home / "ColdvaultVault"
             self.assertFalse(vault.exists())
 
@@ -1338,22 +1962,34 @@ class ReadmeTests(unittest.TestCase):
             self.assertEqual(listings[0], listings[1])
             self.assertIn("START-HERE.md", listings[0])
             for term in ("checklist", "offline"):
-                self.assertTrue(list(vault_kit.hits(str(vault), term)), term)
+                self.assertTrue(list(coldvault.hits(str(vault), term)), term)
 
     def test_sync_recipes_follow_a_privacy_warning(self):
-        text = "\n".join(self.section("## Sync it to other devices"))
+        text = (KIT / "docs" / "sync.md").read_text(encoding="utf-8")
         self.assertIn("**Privacy warning:**", text)
         warning = text.index("**Privacy warning:**")
         recipes = (
             ("**A private git repository.**", "git push -u origin main"),
             ("**Obsidian Sync.**", "ob sync"),
-            ("**iCloud on a Mac.**", "python3 vault_kit.py --username '' --output \"$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Coldvault\""),
+            ("**iCloud on a Mac.**", "python3 coldvault.py --username '' --output \"$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Coldvault\""),
             ("**S3 with rclone.**", "rclone sync ~/ColdvaultVault s3:YOUR-BUCKET/coldvault --exclude '.coldvault/**'"),
         )
         for heading, command in recipes:
             with self.subTest(heading=heading):
                 self.assertLess(warning, text.index(heading))
                 self.assertLess(text.index(heading), text.index(f"\n    {command}\n"))
+
+    def test_uninstall_keeps_the_notes_and_names_every_step(self):
+        text = "\n".join(self.section("## Uninstall"))
+        for step in ("schedule remove --vault", "crontab -e", "launchctl bootout gui/$(id -u)/coldvault.rebuild", "pipx uninstall coldvault",
+                     "rm -rf ~/ColdvaultVault/.coldvault", "notes are yours"):
+            self.assertIn(step, text)
+
+    def test_recover_covers_each_case(self):
+        text = "\n".join(self.section("## Recover"))
+        for case in ("**An interrupted run.**", "**An edited note and its `(Coldvault)` copy.**", "**Rebuilding the search index.**",
+                     "**Moving the vault.**", "**Restoring from the sync target.**"):
+            self.assertIn(case, text)
 
     def test_release_check_quickstart_lines_match_the_readme(self):
         manifest = json.loads((KIT / "release-check.json").read_text(encoding="utf-8"))
@@ -1362,6 +1998,166 @@ class ReadmeTests(unittest.TestCase):
             with self.subTest(entry=entry):
                 self.assertEqual("README.md", entry["file"])
                 self.assertEqual(entry["argv"], shlex.split(self.lines[entry["line"] - 1]))
+
+
+class LegacyNameTests(unittest.TestCase):
+    def test_vault_kit_py_is_a_one_line_shim_for_coldvault_py(self):
+        self.assertEqual("coldvault.py", Path(coldvault.__file__).name)
+        self.assertEqual(1, len((KIT / "vault_kit.py").read_text(encoding="utf-8").splitlines()))
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("python3"), "the scheduled line runs python3 under /bin/sh")
+    def test_an_old_vault_kit_cron_line_still_builds_the_vault(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            home = Path(temporary)
+            (home / "coldvault").mkdir()
+            for name in ("coldvault.py", "vault_kit.py"):
+                shutil.copy2(KIT / name, home / "coldvault" / name)
+            env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+            def run(flags):
+                command = f"""python3 {flags} "$HOME/coldvault/vault_kit.py" --username '' --output "$HOME/ColdvaultVault\""""
+                result = subprocess.run(["/bin/sh", "-c", command], stdin=subprocess.DEVNULL, capture_output=True,
+                                        text=True, env=env, timeout=120)
+                self.assertNotIn("Traceback", result.stdout + result.stderr)
+                return result
+
+            missing = run("")
+            self.assertEqual(2, missing.returncode, missing.stderr)
+            self.assertIn("no transcripts found", missing.stderr)
+            shutil.copytree(KIT / "examples" / "transcripts" / "claude", home / ".claude" / "projects" / "demo")
+            for flags in ("", "-I"):
+                with self.subTest(flags=flags):
+                    result = run(flags)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertTrue(list(coldvault.hits(str(home / "ColdvaultVault"), "checklist")))
+
+    def test_import_vault_kit_still_exposes_the_coldvault_api(self):
+        script = f"import sys; sys.path.insert(0, {str(KIT)!r}); import vault_kit, coldvault; vault_kit.SOURCES = []; print(vault_kit is coldvault, coldvault.SOURCES)"
+        result = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("True []\n", result.stdout)
+
+    def test_security_and_contributing_name_coldvault_and_a_public_contact_path(self):
+        issues = "https://github.com/TayHCode/coldvault/issues"
+        for name in ("SECURITY.md", "CONTRIBUTING.md"):
+            with self.subTest(name=name):
+                text = (KIT / name).read_text(encoding="utf-8")
+                self.assertNotRegex(text, r"(?i)vault[- ]?kit")
+                self.assertNotRegex(text, r"[\w.+-]+@[\w-]+\.[\w.]+")
+                self.assertIn(issues, text)
+
+
+class VaultTemplateTests(unittest.TestCase):
+    def build(self, output):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as source:
+            record = {"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
+            (Path(source) / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            with patch.object(coldvault, "github_repos", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+                coldvault.build(source, output)
+
+    @staticmethod
+    def tree(root):
+        return sorted(p.relative_to(root).as_posix() + ("/" if p.is_dir() else "") for p in root.rglob("*") if ".coldvault" not in p.relative_to(root).parts)
+
+    def test_new_vault_gets_the_template_tree_and_a_working_search(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            output = Path(temporary) / "vault"
+            self.build(output)
+            tree = self.tree(output)
+            session = next(p for p in tree if p.startswith("Sessions/") and p.endswith(".md"))
+            self.assertEqual(sorted([
+                ".obsidian/", ".obsidian/app.json", ".obsidian/core-plugins.json", ".obsidian/daily-notes.json", ".obsidian/templates.json",
+                "Agent-Space/", "Agent-Space/README.md", "Attachments/", "Capabilities/", "Capabilities/README.md",
+                "Context/", "Context/README.md", "Daily/", "Daily/README.md", "Home.md", "Index.md",
+                "Projects/", "Projects/demo.md", "START-HERE.md", "Sessions/", session,
+                "Templates/", "Templates/Capability.md", "Templates/Context.md", "Templates/Daily.md", "Templates/Note.md", "Templates/README.md",
+                "Writing/", "Writing/README.md",
+            ]), tree)
+            app = json.loads((output / ".obsidian/app.json").read_text(encoding="utf-8"))
+            self.assertEqual("Attachments", app["attachmentFolderPath"])
+            plugins = json.loads((output / ".obsidian/core-plugins.json").read_text(encoding="utf-8"))
+            self.assertTrue(plugins["daily-notes"] and plugins["templates"])
+            daily = json.loads((output / ".obsidian/daily-notes.json").read_text(encoding="utf-8"))
+            self.assertTrue((output / f"{daily['template']}.md").is_file())
+            self.assertTrue((output / daily["folder"]).is_dir())
+            for note in output.rglob("*.md"):
+                for target in re.findall(r"\[\[([^\]|#]+)", note.read_text(encoding="utf-8")):
+                    with self.subTest(note=note.name, link=target):
+                        self.assertTrue((output / f"{target}.md").is_file())
+            result = subprocess.run([sys.executable, str(KIT / "coldvault.py"), "search", "--json", "frontmatter", "--vault", str(output)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("Home.md", [hit["path"] for hit in json.loads(result.stdout)])
+
+    def test_rebuilding_keeps_user_edits_and_deletions_in_template_notes(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            output = Path(temporary) / "vault"
+            self.build(output)
+            (output / "Home.md").write_bytes(b"My own home\r\n")
+            (output / "Writing" / "README.md").unlink()
+            self.build(output)
+            self.assertEqual(b"My own home\r\n", (output / "Home.md").read_bytes())
+            self.assertFalse((output / "Writing" / "README.md").exists())
+
+    def test_existing_vault_and_its_obsidian_settings_stay_byte_identical(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            output = Path(temporary) / "vault"
+            (output / ".obsidian").mkdir(parents=True)
+            mine = {".obsidian/app.json": b'{"theme": "mine"}', "My note.md": b"# Mine\n"}
+            for name, content in mine.items():
+                (output / name).write_bytes(content)
+            self.build(output)
+            self.build(output)
+            for name, content in mine.items():
+                self.assertEqual(content, (output / name).read_bytes())
+            self.assertEqual(["app.json"], [p.name for p in (output / ".obsidian").iterdir()])
+            for name in ("Home.md", "Daily", "Templates", "Attachments"):
+                self.assertFalse((output / name).exists(), name)
+
+    def test_template_never_replaces_or_follows_paths_that_appear_after_the_empty_check(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            root, outside = Path(temporary) / "vault", Path(temporary) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / ".obsidian").symlink_to(outside, target_is_directory=True)
+            (root / "Home.md").write_bytes(b"raced in\n")
+            (root / "Daily").mkdir()
+            (outside / "target.md").write_bytes(b"outside\n")
+            (root / "Daily" / "README.md").symlink_to(outside / "target.md")
+            coldvault._apply_template(root)
+            self.assertEqual(["target.md"], [p.name for p in outside.iterdir()])
+            self.assertEqual(b"outside\n", (outside / "target.md").read_bytes())
+            self.assertEqual(b"raced in\n", (root / "Home.md").read_bytes())
+            self.assertEqual(coldvault.VAULT_TEMPLATE["Writing/README.md"], (root / "Writing" / "README.md").read_text(encoding="utf-8"))
+
+    def test_setup_config_alone_still_gets_the_template_and_sync_builds_it(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = Path(temporary)
+            transcripts, output = base / "transcripts", base / "vault"
+            transcripts.mkdir()
+            record = {"type": "user", "cwd": "/work/demo", "message": {"role": "user", "content": "Synthetic"}}
+            (transcripts / "session.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            config = {"version": 1, "transcripts": [str(transcripts)], "notes": [], "notion_exports": [], "username": ""}
+            coldvault._owned_folder(output, (".coldvault",))
+            (output / ".coldvault" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            result = subprocess.run([sys.executable, str(KIT / "coldvault.py"), "sync", "--vault", str(output)], capture_output=True, text=True, timeout=60, env={**os.environ, "HOME": str(base)})
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(coldvault.VAULT_TEMPLATE["Home.md"], (output / "Home.md").read_text(encoding="utf-8"))
+            self.assertTrue(next((output / "Sessions").glob("*.md")).is_file())
+
+    def test_a_built_vault_emptied_by_its_user_does_not_get_the_template_again(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            output = Path(temporary) / "vault"
+            self.build(output)
+            for path in output.iterdir():
+                if path.name != ".coldvault":
+                    shutil.rmtree(path) if path.is_dir() else path.unlink()
+            self.build(output)
+            for name in ("Home.md", "Daily", "Templates", ".obsidian", "Attachments"):
+                self.assertFalse((output / name).exists(), name)
+
+    def test_template_is_placeholder_only(self):
+        text = "\n".join(coldvault.VAULT_TEMPLATE.values())
+        self.assertIsNone(re.search(r"[\w.+-]+@[\w-]+\.[\w.]+|https?://|(?<![\w/])@\w", text))
 
 
 if __name__ == "__main__":

@@ -2,10 +2,10 @@
   "quickstart": [
     {
       "file": "README.md",
-      "line": 25,
+      "line": 31,
       "argv": [
         "python3",
-        "vault_kit.py",
+        "coldvault.py",
         "--username",
         "",
         "--transcripts",
@@ -16,10 +16,10 @@
     },
     {
       "file": "README.md",
-      "line": 31,
+      "line": 35,
       "argv": [
         "python3",
-        "vault_kit.py",
+        "coldvault.py",
         "--notes",
         "examples/notes",
         "--output",
@@ -54,7 +54,7 @@
     {
       "scope": "tree",
       "kind": "home-path",
-      "path": "vault_kit.py",
+      "path": "coldvault.py",
       "fingerprint": "aec22e7053a1fc2c",
       "reason": "The public GitHub API users endpoint, not a local home directory."
     },
@@ -62,6 +62,13 @@
       "scope": "history",
       "kind": "home-path",
       "path": "vault_kit.py",
+      "fingerprint": "aec22e7053a1fc2c",
+      "reason": "The public GitHub API users endpoint, not a local home directory."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "coldvault.py",
       "fingerprint": "aec22e7053a1fc2c",
       "reason": "The public GitHub API users endpoint, not a local home directory."
     },
@@ -85,6 +92,13 @@
       "path": "examples/transcripts/codex/session.jsonl",
       "fingerprint": "127ea76dac6c8b3d",
       "reason": "A synthetic example session ID in an earlier commit, not a host name."
+    },
+    {
+      "scope": "tree",
+      "kind": "export-path-review",
+      "path": "examples/transcripts/claude/demo-session.jsonl",
+      "source_sha256": "42953afeae391c45ab899b61efa3bd227a9b03c5c38d806a9ec6ab143ec27514",
+      "reason": "Reviewed synthetic demo Claude Code transcript used by the README quickstart; the folder name claude matches the agent-config rule, but it is not agent configuration."
     }
   ]
 }

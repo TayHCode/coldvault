@@ -10,10 +10,10 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 [project.scripts]
-coldvault = "vault_kit:main"
+coldvault = "coldvault:main"
 
 [tool.setuptools]
-py-modules = ["vault_kit"]
+py-modules = ["coldvault", "vault_kit"]
 
 [tool.setuptools.dynamic]
-version = {attr = "vault_kit.__version__"}
+version = {attr = "coldvault.__version__"}

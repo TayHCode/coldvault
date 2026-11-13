@@ -1,142 +1,132 @@
 # Coldvault
 
-Build a private Obsidian vault from your Claude Code and Codex conversations and public GitHub repositories. Python 3.9 or newer is all you need; there are no packages to install, and git is optional.
+Build a private Obsidian vault from your Claude Code and Codex conversations and public GitHub repositories. Python 3.9 or newer is all you need; there are no packages to install, and git is optional. Coldvault is tested on Linux; macOS is not fully tested yet, and Windows is not supported for now.
 
-## Quickstart
+## Install
 
 Download the script into a `coldvault` folder in your home folder:
 
     mkdir -p ~/coldvault && cd ~/coldvault
-    curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/vault_kit.py
+    curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/coldvault.py
 
 Or, if you have git, clone the repository instead. The clone also holds the examples used below:
 
     git clone https://github.com/TayHCode/coldvault.git ~/coldvault
     cd ~/coldvault
 
-Then run this one command. It asks for your GitHub username (optional) and where to create the vault. You can instead pass `--transcripts FOLDER` to read a folder of JSONL transcripts.
+To get a `coldvault` command instead of `python3 coldvault.py`, run `pipx install .` from the clone ([pipx](https://pipx.pypa.io)). It takes the same options.
 
-    python3 vault_kit.py
+## Set up
 
-By default it looks in `~/.claude/projects` and `~/.codex/sessions`. Public repositories are fetched by username without login, every page of them; lookup failure or no network simply skips them. GitHub allows 60 unauthenticated requests an hour, and each page holds 100 repositories. To raise that limit, set `GITHUB_TOKEN` to any GitHub token; it is sent only to `api.github.com` and is never printed or written to the vault.
+Run the guided setup:
 
-For an offline example from the repository root:
+    python3 coldvault.py setup
 
-    python3 vault_kit.py --username '' --transcripts examples/transcripts --output ./QuickstartVault
+It checks your Python version and whether SQLite full-text search is available, and shows how many sessions it found in `~/.claude/projects`, `~/.codex/sessions` and `~/.codex/archived_sessions`. Then it asks for the vault folder (new or existing; your files are kept), which transcript and Markdown folders to import, and an optional GitHub username for your public repositories. It saves the answers, and no secrets, in `<vault>/.coldvault/config.json` and builds the vault. Run `setup` again to change them.
 
-To skip every prompt, pass `--username NAME` (use `''` to skip GitHub) and `--output FOLDER`; add `--transcripts FOLDER` to read a folder other than the standard ones. Without a terminal (for example from cron), a missing answer, a missing or empty transcript folder, or an output folder it cannot write stops with a one-line error and exit status 2.
+Transcript imports keep the conversation text, skip tool output, and replace common credential formats (API keys, tokens, private keys, passwords) with `[REDACTED]`.
 
-To import any folder of Markdown notes (a git repository, another Obsidian vault, a Logseq graph, or a Notion or Google Docs Markdown export), pass `--notes FOLDER`:
+To try it offline first, run this from the clone:
 
-    python3 vault_kit.py --notes examples/notes --output ./NotesVault
+    python3 coldvault.py --username '' --transcripts examples/transcripts --output ./QuickstartVault
 
-Each `.md` file is copied, with its subfolders, under `Imported/<folder name>/` and linked from the index. Hidden files and folders (such as `.git`, `.obsidian` and `.trash`) and symlinks are skipped, and other files such as images are not copied. With `--notes` and no `--transcripts`, only notes are imported and GitHub is skipped unless you pass `--username`. Repeat `--notes` to import several folders; folders with the same name get a short suffix derived from their path. The index lists the notes from the folders passed on that run, so pass every folder each time. For a Logseq graph, pass its `pages` and `journals` folders so its `logseq/bak` backups are not imported.
+Any folder of Markdown notes can be imported too (this example also uses the clone):
 
-For Notion, export a page or workspace with **Export → Markdown & CSV** and pass the downloaded zip (or the folder it unzips to) with `--notion-export`:
+    python3 coldvault.py --notes examples/notes --output ./NotesVault
 
-    python3 vault_kit.py --notion-export ~/Downloads/Export.zip --output ./NotionVault
-
-Pages land under `Imported/Notion/` without Notion's 32-character ID in their file and folder names, and links between pages become `[[wikilinks]]` (a link's `#section` is kept; links inside code are left as written). Each database becomes a note holding its rows as a Markdown table, so row values are searchable. Notion's multi-part download, a zip holding only `…-Part-N.zip` files, is read too. Images and other attachments, zip files included, are not copied; their links become `name (not imported)`. Hidden and `__MACOSX` entries are skipped. Notes that would share a name keep the first 8 characters of their ID (or of a hash of their path when they have no ID). Each note's frontmatter records `source: notion` and, when its filename has one, its `notion-id`.
-
-To keep Notion pages in sync through the Notion API instead, create an internal integration at [notion.so/profile/integrations](https://www.notion.so/profile/integrations) with the "Read content" capability, share the pages you want with it (page menu → **Connections**), and save its token in a file only you can read:
-
-    python3 vault_kit.py notion-sync --token-file ~/.config/notion-token --out "./NotionSync-$(date +%Y%m%d-%H%M%S)" --state ./notion-state
-
-Run `chmod 600` on the token file first; the command refuses a token file other users can read. The token is sent only to `api.notion.com` and never printed or written anywhere. Each page shared with the integration becomes `Imported/Notion/<title>-<first 8 characters of its ID>.md` (pass `--folder` to choose another folder inside `--out`), read as Notion-flavored Markdown; parts of a very large page that Notion leaves out of the first reply are fetched separately. Its frontmatter records `source: notion`, `notion-id`, `last-edited` and `authorship: other`. Expiring file and image links are replaced by their captions with `(file not imported)`; attachments are not downloaded, and database properties other than the title are not copied. Requests stay at or below 3 per second and wait as long as a rate-limit reply asks. Every run lists all shared pages, then fetches only pages whose `last_edited_time` changed or that are new. Each run writes every shared page into `--out`, which must be a new or empty folder or one notion-sync started (it leaves a `.notion-sync` file there); the command refuses any other folder and never deletes a file. A rerun into a folder it started rewrites the notes there, so copy notes out before editing them. A renamed, deleted, trashed or unshared page is left out of the manifest and its old path is listed under `retired` in the receipt. `--out` also gets `manifest.jsonl` (every note with its SHA-256) and `receipt.json` (counts, page IDs and paths only), and the receipt is also printed on standard output as one JSON line. Keep `--state` outside `--out` and reuse it between runs. A run stops fetching after `--budget-seconds` (default 300). The exit status is 0 when Notion pages changed since the last run that exited 0, 10 when none did (the notes are still written to `--out`), 20 when the budget ran out first (run again to continue where it stopped) and 1 on error, including a part of a page that Notion refuses to return.
-
-It creates `START-HERE.md`, an index, a project note for each repository or detected project, and linked notes for each transcript session. A project is the folder a session ran in, so two different folders named `app` get two notes (`app` and `app-` plus a short suffix). A session note is named by its project folder and transcript file name, not by where the transcript is stored, so moving or copying your transcript folder and rebuilding keeps the same notes. When you rebuild a vault made by an older version, session notes it named by transcript location are replaced by the new names if you haven't edited them; edited ones are kept. Transcript imports keep conversation text, skip tool outputs, and replace common credential formats (provider API keys, GitHub and Slack tokens, cloud access keys, Notion tokens, private keys, JWTs, `Bearer` tokens, passwords inside URLs and literal `password = ...` style assignments) with `[REDACTED]`. Imported notes get the same redaction.
-
-Search the vault from a terminal:
-
-    python3 vault_kit.py search TERM --vault ./QuickstartVault
-
-Every word must appear somewhere in a note (punctuation and accents are ignored), and each word also matches longer words that start with it. Notes are ranked by relevance with SQLite full-text search when your Python includes it; otherwise they are listed in path order. Each matching line is printed as `path:line: text`. Add `--json` to get a JSON list of `{"path", "line", "text"}` objects instead, or `[]` when nothing matches. Either way the command exits 1 when nothing matches.
-
-The first search builds an index in `.coldvault/search.sqlite` inside the vault, and later searches update it only for notes that were added, changed or deleted since, so they stay fast in a large vault. The folder carries its own `.gitignore`, so it never ends up in a git-backed vault, and deleting it only means the next search rebuilds it. When the vault folder is read-only, the index goes to `~/.cache/coldvault/` instead (or `$XDG_CACHE_HOME/coldvault/`). Search never follows a symlink to place the index, and never writes into a database it didn't create. When either folder is unusable, it falls back to the next one, and finally to an in-memory index.
-
-Existing notes are preserved; when a generated note's filename is already in use, Coldvault writes its copy with `(Coldvault)` in the name and refreshes only notes marked as Coldvault-managed that you have not edited. Notes and `(Vault Kit)` copies written by older versions, marked `vault-kit-managed`, are still recognized and refreshed in place. If you edit a generated note (or it comes from an older version and cannot be verified), it is kept and Coldvault writes a fresh copy beside it. Notes are written atomically, so an interrupted run never leaves a half-written note. Links always point at the note Coldvault wrote, and running it again updates sessions whose transcripts have grown and imported notes that changed.
-
-## Install as a command
-
-To get a `coldvault` command instead of `python3 vault_kit.py`, install it with [pipx](https://pipx.pypa.io) from the repository root:
-
-    pipx install .
-    coldvault --version
-
-`coldvault` takes the same options as `python3 vault_kit.py`, for example `coldvault search TERM --vault ./QuickstartVault`.
+Notion, ChatGPT and Claude.ai exports, and more on each source, are in [Import other sources](docs/sources.md).
 
 ## Open it in Obsidian
 
-In Obsidian, open the vault switcher, choose **Open folder as vault** and pick the folder you passed as `--output`. Start from `START-HERE.md`.
+In Obsidian, open the vault switcher, choose **Open folder as vault** and pick your vault folder. Start from `START-HERE.md`.
 
-## Keep it up to date
+A new vault starts with a `Home.md` map, starter folders, templates and Obsidian settings for daily notes. Those notes are yours: Coldvault never changes them. It writes a project note per repository or project folder, a note per session under `Sessions/`, and a `Daily/` note per day. When you edit a note Coldvault wrote, it keeps your version. [What Coldvault writes](docs/vault.md) has the details.
 
-Running Coldvault again into the same folder adds new sessions and updates changed ones, so it is safe to run on a schedule. The lines below rebuild `~/ColdvaultVault` every hour from the standard Claude and Codex folders, using the `~/coldvault/vault_kit.py` from the quickstart. Replace `''` with your GitHub username to include your public repositories.
+## Schedule
 
-On Linux, add this line with `crontab -e`:
+Rebuild the vault every hour (or every `--hours N`, where N is 2, 3, 4, 6, 8, 12 or 24). Here and below, replace `~/ColdvaultVault` with the vault folder you chose in `setup`:
 
-    0 * * * * python3 "$HOME/coldvault/vault_kit.py" --username '' --output "$HOME/ColdvaultVault"
+    python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault
 
-On a Mac, create a launchd agent and load it:
+This adds one line to your crontab on Linux and leaves your other lines alone. `schedule remove --vault ~/ColdvaultVault` deletes it. On a Mac, use the steps in [Customize your vault](docs/customize.md#schedule), with `sync --vault` and your vault folder in the scheduled line so it reuses your saved setup.
 
-    mkdir -p ~/Library/LaunchAgents
-    cat > ~/Library/LaunchAgents/coldvault.rebuild.plist <<'EOF'
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-      <key>Label</key>
-      <string>coldvault.rebuild</string>
-      <key>ProgramArguments</key>
-      <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>python3 "$HOME/coldvault/vault_kit.py" --username '' --output "$HOME/ColdvaultVault"</string>
-      </array>
-      <key>StartInterval</key>
-      <integer>3600</integer>
-    </dict>
-    </plist>
-    EOF
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/coldvault.rebuild.plist
+Claude Code deletes transcripts after `cleanupPeriodDays` days (30 by default). Notes already in the vault stay, but a deleted transcript can't be imported again. Raise the limit in `~/.claude/settings.json`, for example `"cleanupPeriodDays": 365`.
 
-The first run is an hour later. To run it now, use `launchctl kickstart gui/$(id -u)/coldvault.rebuild`; to stop it, use `launchctl bootout gui/$(id -u)/coldvault.rebuild`.
+## Check that it is working
+
+    python3 ~/coldvault/coldvault.py status --vault ~/ColdvaultVault
+
+It prints each source as `ok`, `failed (reason)` or `skipped`, the time of the last fully successful run, and when the next scheduled run is due. It exits 0 when the last run succeeded, and 1 when it failed or no run has succeeded for twice the schedule interval.
+
+To search the vault from a terminal, run `python3 coldvault.py search TERM --vault ~/ColdvaultVault` (add `--json` for JSON).
 
 ## Sync it to other devices
 
-**Privacy warning:** each recipe below copies your conversations off this machine. Redaction replaces common credential formats, not every private thing you typed. Send the vault only to places that only you can read: a private repository, your own Obsidian Sync or iCloud account, or a private bucket. Use one of these per vault, not several at once.
+To reach your vault on other devices, see [Sync it to other devices](docs/sync.md): a private git repository, Obsidian Sync, iCloud or S3. Read its privacy warning first.
 
-**A private git repository.** Create an empty private repository on your git host, then push the vault to it. The search index in `.coldvault/` has its own `.gitignore`, so it is never committed.
+## Uninstall
 
-    cd ~/ColdvaultVault
-    git init -b main
-    git add -A
-    git commit -m "Vault update"
-    git remote add origin https://github.com/YOUR-NAME/YOUR-VAULT.git
-    git push -u origin main
+Uninstalling removes Coldvault, not your vault. The notes are yours and stay: they are plain Markdown files that Obsidian opens without Coldvault. Delete the vault folder yourself only if you no longer want them.
 
-After each rebuild, run `git add -A && git commit -m "Vault update" && git push` from the vault folder.
+First stop the schedule, while the vault still has its saved setup. If you set it up with `schedule`, remove it:
 
-**Obsidian Sync.** This needs an Obsidian Sync subscription, a remote vault created in Obsidian, and Node.js for [Obsidian Headless](https://obsidian.md/help/sync/headless) (open beta). Don't also sync this folder with the Obsidian app on the same machine.
+    python3 ~/coldvault/coldvault.py schedule remove --vault ~/ColdvaultVault
 
-    npm install -g obsidian-headless
-    ob login
-    cd ~/ColdvaultVault
-    ob sync-setup --vault "YOUR REMOTE VAULT"
-    ob sync
+If you added the line by hand, run `crontab -e` and delete the line that runs `coldvault.py` (or the older `vault_kit.py`). On a Mac, unload the launchd agent and delete it:
 
-**iCloud on a Mac.** Build the vault inside Obsidian's iCloud folder, which appears once Obsidian is installed with iCloud Drive turned on. The vault then opens in Obsidian on your iPhone and iPad. Use the same `--output` in your schedule.
+    launchctl bootout gui/$(id -u)/coldvault.rebuild
+    rm ~/Library/LaunchAgents/coldvault.rebuild.plist
 
-    python3 vault_kit.py --username '' --output "$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Coldvault"
+Then remove the program. If you installed the `coldvault` command, run `pipx uninstall coldvault`. If you downloaded the script, delete it:
 
-**S3 with rclone.** Set up a remote for your bucket with `rclone config` (named `s3` here) and turn on bucket versioning, so an unwanted change can be undone. `rclone sync` makes the bucket folder match the vault, deleting files there that the vault no longer has.
+    rm -f ~/coldvault/coldvault.py ~/coldvault/vault_kit.py
 
-    rclone sync ~/ColdvaultVault s3:YOUR-BUCKET/coldvault --exclude '.coldvault/**'
+If you cloned the repository, first move out any vault you built inside it (such as `QuickstartVault`), then delete the clone.
+
+Last, delete what Coldvault keeps for itself: the `.coldvault/` folder in the vault (saved `setup` answers, caches, run records and the search index) and the fallback search index used for read-only vaults:
+
+    rm -rf ~/ColdvaultVault/.coldvault
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/coldvault"
+
+If you used the Notion API sync that earlier versions had, also delete the folder you passed as `--state`; it holds copies of your pages.
+
+## Recover
+
+**An interrupted run.** Run the same command again. Notes are written atomically, so a run that was stopped (Ctrl-C, a crash, a closed laptop) leaves each note either as it was or fully updated, and the next run finishes the job. `status` shows whether the last run succeeded.
+
+**An edited note and its `(Coldvault)` copy.** When you edit a note Coldvault wrote, your version is never changed again. For a session note, later messages go to a `(continued)` note beside it. For any other note, such as a project note, Coldvault writes its updates to a copy beside it, such as `Projects/sample-project (Coldvault).md`, and links point to the copy. To keep your edits, leave both. To go back to Coldvault's version, delete your edited note and the `(continued)` or `(Coldvault)` notes beside it (older versions named copies `(Vault Kit)`, and a copy you also edited gets a numbered one such as `(Coldvault 2)`). Move any of them out of the vault first if you want to keep your edits. Then run Coldvault again. It writes the note under its original name.
+
+**Rebuilding the search index.** Delete the index; the next search builds a new one:
+
+    rm -f ~/ColdvaultVault/.coldvault/search.sqlite*
+    python3 "$HOME/coldvault/coldvault.py" search checklist --vault ~/ColdvaultVault
+
+Deleting the whole `.coldvault/` folder also rebuilds the index, but it forgets the answers saved by `setup` and the run history, and the next run re-reads every transcript. For a read-only vault, the index is in `${XDG_CACHE_HOME:-$HOME/.cache}/coldvault/` instead.
+
+**Moving the vault.** Close the vault in Obsidian. A schedule made with `schedule` is tied to the old folder, so remove it first. Then move the folder, run Coldvault into the new place and schedule it again:
+
+    python3 ~/coldvault/coldvault.py schedule remove --vault ~/ColdvaultVault
+    mkdir -p ~/Documents
+    mv ~/ColdvaultVault ~/Documents/ColdvaultVault
+    python3 "$HOME/coldvault/coldvault.py" sync --vault "$HOME/Documents/ColdvaultVault"
+    python3 ~/coldvault/coldvault.py schedule --vault ~/Documents/ColdvaultVault
+
+`.coldvault/` moves with the vault, so the answers saved by `setup` still apply, and the search index rebuilds itself on the next search. If you never ran `setup`, run your usual command with the new `--output` instead and change `--output` in your cron line. On a Mac, change it in the plist and reload it as described in [Customize your vault](docs/customize.md#schedule). Open the new folder in Obsidian with **Open folder as vault**.
+
+**Restoring from the sync target.** See [Restore from the sync target](docs/sync.md#restore-from-the-sync-target).
 
 ## Privacy
 
-The vault contains your own conversations. Keep it private like the transcripts it comes from. The script writes only inside the output folder you choose, plus the search index described above, which holds a copy of your notes' text.
+The vault contains your own conversations. Keep it private like the transcripts it comes from. The script writes only inside the output folder you choose, plus the search index, which holds a copy of your notes' text.
 
 ## Limitations
 
 Transcript formats can change, and public GitHub lookup requires an internet connection. Only public repositories are found; private repositories are not accessed.
+
+## More guides
+
+- [Import other sources](docs/sources.md): Markdown folders, Notion, ChatGPT and Claude.ai exports, and GitHub.
+- [Sync it to other devices](docs/sync.md): private git, Obsidian Sync, iCloud and S3, and restoring from them.
+- [What Coldvault writes](docs/vault.md): the notes, their frontmatter, edits, reruns and the search index.
+- [Customize your vault](docs/customize.md): which sources to import, folder names and the schedule.
+- [Add a source](docs/add-a-source.md): a worked example that imports a bookmarks file, with its fixture and test.
