@@ -43,7 +43,11 @@ The starter folders created in a new vault (`Writing/`, `Context/`, `Capabilitie
 
 ## Schedule
 
-On Linux, `python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault` adds one crontab line that rebuilds the vault every hour (or every `--hours N`, where N is 2, 3, 4, 6, 8, 12 or 24; runs start on the hour) and saves the interval as `schedule_hours`. Running it again replaces that line, and `schedule remove --vault ~/ColdvaultVault` deletes it. Windows is not supported for now.
+On Linux and macOS, `python3 ~/coldvault/coldvault.py schedule install --vault ~/ColdvaultVault` schedules the vault every hour. Use `--hours N` to set an interval of 2, 3, 4, 6, 8, 12, or 24 hours, counted from local midnight. Run `schedule install` again to change the interval or `schedule remove --vault ~/ColdvaultVault` to remove the job.
+
+If you already set up a manual job for the same vault, remove that job first. See [Uninstall](../README.md#uninstall) for how to stop a manual job.
+
+If a scheduled Mac sync gets a permission error on a protected folder such as Desktop or Documents, move the vault or source to an unprotected folder in your home directory.
 
 Use the same lock as Coldvault when you edit your Linux crontab by hand:
 

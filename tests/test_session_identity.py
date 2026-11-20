@@ -54,7 +54,7 @@ class SessionIdentityTests(unittest.TestCase):
                 if case == "divergent copies":
                     shutil.copyfile(transcript, source / "copy.jsonl")
                 elif case != "successive divergent copies":
-                    legacy_key = hashlib.sha1(b"/work/demo\nsession").hexdigest()[:8]
+                    legacy_key = hashlib.sha1(b"/work/demo\nsession", usedforsecurity=False).hexdigest()[:8]
                     legacy = first.with_name(f"2026-11-01-demo-{legacy_key}.md")
                     legacy_body = re.sub(rb"(?m)^session-id-fallback: .*\n", b"", first.read_bytes())
                     unhashed = re.sub(rb"(?m)^coldvault-hash: .*\n", b"", legacy_body)
@@ -108,7 +108,7 @@ class SessionIdentityTests(unittest.TestCase):
                 transcript = source / "session.jsonl"
                 transcript.write_text(json.dumps(record), encoding="utf-8")
                 first, = self.sync(source, output)
-                key = hashlib.sha1(b"/work/demo\nsession").hexdigest()[:8]
+                key = hashlib.sha1(b"/work/demo\nsession", usedforsecurity=False).hexdigest()[:8]
                 legacy = first.with_name(f"2026-11-01-demo-{key}.md")
                 original = re.sub(r"(?m)^session-id-fallback: .*\n", "", first.read_text(encoding="utf-8"))
                 edited = original.replace("First message", "My rewrite")

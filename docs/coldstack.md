@@ -38,3 +38,10 @@ The notes appear under `Imported/coldfix-lessons/`, `Imported/coldverify-reports
 The index lists only the folders passed on that run, so pass all of them every time. To save them once instead, run `setup` and enter the folders when it asks for Markdown folders. `sync --vault ~/ColdvaultVault` then imports them on every run, including scheduled ones.
 
 To stop importing a tool's output, leave its folder out of the command, or, if you saved it with `setup`, run `setup` again without it. Notes already imported stay in the vault until you delete them. There is nothing else to turn off.
+
+## Organize agent notes in the vault
+
+If you keep agent notes in your vault, create these folders in Obsidian as needed. Add links to them from your `Home.md`.
+
+- `Agent-Space/` holds notes written by your agents. Use `Agent-Space/Notes/<project>.md` for each project's lessons and decisions and `Agent-Space/Proposals/` for larger plans.
+- `Capabilities/` holds one note per tool, skill, or service. Record what it does, when to use it, and how.

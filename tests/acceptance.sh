@@ -33,18 +33,19 @@ home=$(getent passwd "$user" | cut -d: -f6)
 install -d -o "$user" -g "$user" "$home/.claude" "$home/.claude/projects"
 install -o "$user" -g "$user" -m 600 "$kit/examples/transcripts/claude/demo-session.jsonl" "$home/.claude/projects/"
 
+version=$(sed -nE 's/^__version__ = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$kit/coldvault.py")
+download="curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v$version/coldvault.py"
 if [ -n "$candidate" ]; then
-  grep -qF "curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/coldvault.py" "$readme"
+  grep -qF "$download" "$readme"
   echo "+ (candidate) install $candidate as ~/coldvault/coldvault.py instead of the README download"
   install -d -o "$user" -g "$user" "$home/coldvault"
   install -o "$user" -g "$user" -m 644 "$candidate" "$home/coldvault/coldvault.py"
 else
-  step "mkdir -p ~/coldvault && cd ~/coldvault" \
-       "curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/coldvault.py"
+  step "mkdir -p ~/coldvault && cd ~/coldvault" "$download"
 fi
 
 printf '%s\n' "$home/ColdvaultVault" '' '' '' '' '' '' '' | step "cd ~/coldvault" "python3 coldvault.py setup"
-step "python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault"
+step "python3 ~/coldvault/coldvault.py schedule install --vault ~/ColdvaultVault"
 
 runs=$home/ColdvaultVault/.coldvault/runs.jsonl
 before=$(wc -l < "$runs")

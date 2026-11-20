@@ -1,13 +1,15 @@
 # Coldvault
 
-Build a private Obsidian vault from your Claude Code and Codex conversations and public GitHub repositories. Python 3.9 or newer is all you need; there are no packages to install, and git is optional. Coldvault is tested on Linux; macOS is not fully tested yet, and Windows is not supported for now.
+Build a private Obsidian vault from your Claude Code and Codex conversations and public GitHub repositories. Coldvault runs on Linux and macOS with Python 3.9 or newer. There are no packages to install, and git is optional.
 
 ## Install
 
 Download the script into a `coldvault` folder in your home folder:
 
     mkdir -p ~/coldvault && cd ~/coldvault
-    curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/coldvault.py
+    curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v0.3.0/coldvault.py
+
+Check the download with `shasum -a 256 coldvault.py` on macOS or `sha256sum coldvault.py` on Linux. The SHA-256 for v0.3.0 is `b2ac69e2c44e098929ce02cac6d85dac86c24519bb0659da85ed0e6b574e7684`.
 
 Or, if you have git, clone the repository instead. The clone also holds the examples used below:
 
@@ -46,9 +48,9 @@ A new vault starts with a `Home.md` map, starter folders, templates and Obsidian
 
 Rebuild the vault every hour (or every `--hours N`, where N is 2, 3, 4, 6, 8, 12 or 24). Here and below, replace `~/ColdvaultVault` with the vault folder you chose in `setup`:
 
-    python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault
+    python3 ~/coldvault/coldvault.py schedule install --vault ~/ColdvaultVault
 
-This adds one line to your crontab on Linux and leaves your other lines alone. `schedule remove --vault ~/ColdvaultVault` deletes it. On a Mac, use the steps in [Customize your vault](docs/customize.md#schedule), with `sync --vault` and your vault folder in the scheduled line so it reuses your saved setup.
+On Linux, this adds a crontab entry for your vault. On a Mac, run it while logged into your desktop session. It installs a LaunchAgent that starts a sync when loaded and then runs on the scheduled hours while you are logged in. On both platforms, scheduled hours use local time and `schedule remove --vault ~/ColdvaultVault` removes the job for that vault.
 
 If you edit your Linux crontab by hand, use the [shared lock](docs/customize.md#schedule) to prevent overlapping saves.
 
@@ -74,7 +76,9 @@ First stop the schedule, while the vault still has its saved setup. If you set i
 
     python3 ~/coldvault/coldvault.py schedule remove --vault ~/ColdvaultVault
 
-If you added the line by hand, use the [shared lock](docs/customize.md#schedule) to open `crontab -e` and delete the line that runs `coldvault.py` (or the older `vault_kit.py`). On a Mac, unload the launchd agent and delete it:
+On macOS, replacing or removing a schedule stops any sync that the LaunchAgent is running. Wait for the current run to finish if you want it to complete.
+
+If you set up a job by hand, remove it using the same scheduler. On Linux, use the [shared lock](docs/customize.md#schedule) to open `crontab -e` and delete the line that runs `coldvault.py` (or the older `vault_kit.py`). To remove the older Mac job named `coldvault.rebuild`, run these commands:
 
     launchctl bootout gui/$(id -u)/coldvault.rebuild
     rm ~/Library/LaunchAgents/coldvault.rebuild.plist
@@ -108,10 +112,10 @@ Deleting the whole `.coldvault/` folder also rebuilds the index, but it forgets 
 **Moving the vault.** Close the vault in Obsidian. A schedule made with `schedule` is tied to the old folder, so remove it first. Then move the folder, run Coldvault into the new place and schedule it again:
 
     python3 ~/coldvault/coldvault.py schedule remove --vault ~/ColdvaultVault
-    mkdir -p ~/Documents
-    mv ~/ColdvaultVault ~/Documents/ColdvaultVault
-    python3 "$HOME/coldvault/coldvault.py" sync --vault "$HOME/Documents/ColdvaultVault"
-    python3 ~/coldvault/coldvault.py schedule --vault ~/Documents/ColdvaultVault
+    mkdir -p ~/Vaults
+    mv ~/ColdvaultVault ~/Vaults/ColdvaultVault
+    python3 "$HOME/coldvault/coldvault.py" sync --vault "$HOME/Vaults/ColdvaultVault"
+    python3 ~/coldvault/coldvault.py schedule install --vault ~/Vaults/ColdvaultVault
 
 `.coldvault/` moves with the vault, so the answers saved by `setup` still apply, and the search index rebuilds itself on the next search. If you never ran `setup`, run your usual command with the new `--output` instead and change `--output` in your cron line. On a Mac, change it in the plist and reload it as described in [Customize your vault](docs/customize.md#schedule). Open the new folder in Obsidian with **Open folder as vault**.
 

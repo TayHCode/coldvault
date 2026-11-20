@@ -2,7 +2,7 @@
   "quickstart": [
     {
       "file": "README.md",
-      "line": 31,
+      "line": 33,
       "argv": [
         "python3",
         "coldvault.py",
@@ -16,7 +16,7 @@
     },
     {
       "file": "README.md",
-      "line": 35,
+      "line": 37,
       "argv": [
         "python3",
         "coldvault.py",

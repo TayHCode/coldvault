@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import plistlib
 import posixpath
 import re
 import shlex
@@ -37,7 +38,7 @@ try:
 except ImportError:
     sqlite3 = None
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def slug(value):
@@ -795,7 +796,7 @@ _SCHEDULE_HOURS = (1, 2, 3, 4, 6, 8, 12, 24)
 
 
 def _schedule_id(root):
-    return hashlib.sha1(str(root).encode()).hexdigest()[:12]
+    return hashlib.sha1(str(root).encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 def _cron_zone():
@@ -825,13 +826,18 @@ def _cron_hour(hours):
     return "*" if hours == 1 else "0" if hours == 24 else f"*/{hours}"
 
 
+def _sync_command(root):
+    return [sys.executable, str(Path(__file__).resolve()), "sync", "--vault", str(root)]
+
+
 def _cron_command(root):
-    command = [sys.executable, str(Path(__file__).resolve()), "sync", "--vault", str(root)]
-    return " ".join(map(shlex.quote, command)).replace("%", "\\%")
+    return " ".join(map(shlex.quote, _sync_command(root))).replace("%", "\\%")
 
 
 def _schedule_status(root, expected_hours, now):
     expected = f" (expected every {expected_hours}h)" if expected_hours else ""
+    if sys.platform == "darwin":
+        return _launch_status(root, expected, now)
     if sys.platform != "linux":
         return f"schedule: installation unverified{expected}"
     try:
@@ -914,14 +920,104 @@ def _remove_cron(parser, root):
     return removed > 0
 
 
+def _launch_agent(root):
+    label = "com.coldvault.sync." + _schedule_id(root)
+    domain = f"gui/{os.getuid()}"
+    path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    return label, domain, f"{domain}/{label}", path
+
+
+def _launch_intervals(hours):
+    if hours == 1:
+        return [{"Minute": 0}]
+    return [{"Hour": hour, "Minute": 0} for hour in range(0, 24, hours)]
+
+
+def _launch_job(service):
+    return _run(["/bin/launchctl", "print", service], missing_ok="could not find service")
+
+
+def _launch_status(root, expected, now):
+    _, _, service, _ = _launch_agent(root)
+    try:
+        job = _launch_job(service)
+    except OSError:
+        return f"schedule: unknown{expected}"
+    if not job:
+        return f"schedule: installation unverified{expected}" if expected else "schedule: not installed"
+    arguments = re.search(r"^\targuments = \{\n(.*?)^\t\}$", job, re.S | re.M)
+    program = re.search(r"(?m)^\tprogram = (.+)$", job)
+    command = _sync_command(root)
+    if arguments and program and program[1] == command[0]:
+        if arguments[1].splitlines() == ["\t\t" + arg for arg in command]:
+            descriptors = re.findall(
+                r"\t{3}stream = com\.apple\.launchd\.calendarinterval\n[^{}]*"
+                r"\t{3}descriptor = \{\n([^{}]*)\t{3}\}", job,
+            )
+            loaded = sorted(sorted(line.strip() for line in part.splitlines()) for part in descriptors)
+            for hours in _SCHEDULE_HOURS:
+                intervals = sorted(sorted(f'"{key}" => {value}' for key, value in interval.items())
+                                   for interval in _launch_intervals(hours))
+                if loaded == intervals:
+                    return f"schedule: installed, next run due {_next_run(now, hours, _cron_zone())} (every {hours}h)"
+    return "schedule: installed, next run due unknown"
+
+
+def _edit_launch_agent(root, hours=None):
+    label, domain, service, path = _launch_agent(root)
+    loaded = _launch_job(service)
+    if loaded:
+        origin = re.search(r"(?m)^\tpath = (.+)$", loaded)
+        if not origin or Path(origin[1]).resolve() != path.resolve():
+            raise OSError(f"launchd job {service} was loaded from another path")
+    if path.is_symlink():
+        raise OSError(f"cannot change symlink {path}")
+    try:
+        previous = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        previous = None
+    except UnicodeError as error:
+        raise OSError(f"cannot read {path}: {error}") from error
+    if hours is not None:
+        if loaded and previous is None:
+            raise OSError("the loaded LaunchAgent has no plist to restore on failure. Run 'schedule remove' first")
+        job = {"Label": label, "ProgramArguments": _sync_command(root), "RunAtLoad": True,
+               "StartCalendarInterval": _launch_intervals(hours)}
+        try:
+            plist = plistlib.dumps(job).decode("utf-8")
+        except ValueError as error:
+            raise OSError(f"cannot write a LaunchAgent for {root}: {error}") from error
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if loaded:
+        _run(["/bin/launchctl", "bootout", service])
+    try:
+        if hours is None:
+            path.unlink(missing_ok=True)
+        else:
+            _atomic_write(path, plist)
+            _run(["/bin/launchctl", "bootstrap", domain, str(path)])
+    except (OSError, KeyboardInterrupt) as error:
+        try:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write(path, previous)
+                if loaded:
+                    _run(["/bin/launchctl", "bootstrap", domain, str(path)])
+        except OSError as rollback_error:
+            raise OSError(f"{error}. Restoring the LaunchAgent also failed: {rollback_error}") from error
+        raise
+    return bool(loaded) or previous is not None
+
+
 def schedule_main(argv):
-    parser = argparse.ArgumentParser(prog=f"{Path(sys.argv[0]).name} schedule", description="Run 'coldvault sync' for a vault from your crontab on a schedule, or remove that schedule. Other crontab lines are left alone.")
+    parser = argparse.ArgumentParser(prog=f"{Path(sys.argv[0]).name} schedule", description="Install or remove a schedule for one vault using cron on Linux or launchd on macOS.")
     parser.add_argument("action", nargs="?", choices=("install", "remove"), default="install")
     parser.add_argument("--vault", required=True, help="Vault folder set up with 'coldvault setup'")
     parser.add_argument("--hours", type=int, default=1, choices=_SCHEDULE_HOURS, help="Hours between runs, on the hour (default 1)")
     args = parser.parse_args(argv)
-    if sys.platform != "linux":
-        parser.error("schedule supports Linux only; on a Mac use the LaunchAgent steps in docs/customize.md, elsewhere run 'coldvault sync' from your own scheduler")
+    if sys.platform not in ("linux", "darwin"):
+        parser.error("schedule supports Linux and macOS; run 'coldvault sync' from your own scheduler on other systems")
     import fcntl
     lock = Path.home() / ".cache" / "coldvault-schedule.lock"
     try:
@@ -939,8 +1035,7 @@ def _schedule_locked(parser, args):
     config = _load_config(parser, root)
     if config is None:
         parser.error(f"no saved config in {root}; run: coldvault setup")
-    command = _cron_command(root)
-    if "\n" in command or "\r" in command:
+    if any("\n" in arg or "\r" in arg for arg in _sync_command(root)):
         parser.error("cannot schedule a path that contains a line break")
     saved = json.dumps(config, indent=2) + "\n"
     config.pop("schedule_hours", None)
@@ -951,8 +1046,16 @@ def _schedule_locked(parser, args):
     except OSError as error:
         parser.error(f"cannot save the config in {root}: {error}")
     try:
-        if args.action == "install":
-            _install_cron(parser, root, command, args.hours)
+        if sys.platform == "darwin":
+            if args.action == "install":
+                replaced = _edit_launch_agent(root, args.hours)
+                print(f"{'Replaced' if replaced else 'Installed'} LaunchAgent for {root}")
+            elif _edit_launch_agent(root):
+                print(f"Removed LaunchAgent for {root}")
+            else:
+                print(f"No Coldvault schedule found for {root}")
+        elif args.action == "install":
+            _install_cron(parser, root, _cron_command(root), args.hours)
         elif not _remove_cron(parser, root):
             print(f"No Coldvault schedule found for {root}")
     except BaseException as error:
@@ -1046,7 +1149,7 @@ def _import_folders(run):
     exports = list(dict.fromkeys(Path(export).expanduser().resolve() for export in run.notion_exports))
     bases = [source.name.lstrip(".") or "notes" for source in sources] + ["Notion"] * len(exports)
     folders = [
-        f"{base} ({hashlib.sha1(str(source).encode()).hexdigest()[:8]})"
+        f"{base} ({hashlib.sha1(str(source).encode(), usedforsecurity=False).hexdigest()[:8]})"
         if [b.casefold() for b in bases].count(base.casefold()) > 1 else base
         for source, base in zip(sources + exports, bases)
     ]
@@ -1241,7 +1344,7 @@ def notion_notes(export, vault, folder):
     used = {dest.casefold() for dest, _, _ in planned.values() if taken[dest.casefold()] == 1}
     for name, entry in planned.items():
         if taken[entry[0].casefold()] > 1:
-            base = entry[0] + " " + (entry[1] or hashlib.sha1(name.encode()).hexdigest())[:8]
+            base = entry[0] + " " + (entry[1] or hashlib.sha1(name.encode(), usedforsecurity=False).hexdigest())[:8]
             entry[0], number = base, 1
             while entry[0].casefold() in used:
                 number += 1
@@ -1269,14 +1372,15 @@ def _home(folders):
         "This is your vault map. Coldvault fills some folders on every run; the rest are yours.\n\n"
         "- [[START-HERE]]: how to use and search the vault.\n"
         "- [[Index]]: every project and imported note Coldvault wrote.\n"
-        f"- `{folders['projects']}/`: one note per project, generated from your sessions and repositories.\n"
-        f"- `{folders['sessions']}/`: one note per Claude Code or Codex conversation, generated.\n"
+        f"- [[Index#Projects|Projects]]: project notes in `{folders['projects']}/` collect sessions and repository context.\n"
+        f"- [[START-HERE|AI conversations]]: browse transcripts in `{folders['sessions']}/` through their project notes.\n"
+        f"- [[Index#Projects|GitHub repositories]]: find repository details in the corresponding notes in `{folders['projects']}/`.\n"
+        "- [[Writing/README|Notes and writing]]: keep your notes, research, and drafts in Writing.\n"
+        "- [[Decisions/README|Decisions]]: record what you decided and what you learned.\n"
+        "- [[Context/README|Reference]]: keep articles, posts, and other material from outside the vault.\n"
+        "- [[Archive/README|Archive]]: keep older material you want to refer to later.\n"
         f"- `{folders['imported']}/`: Markdown folders and Notion exports you imported, generated.\n"
         "- [[Daily/README|Daily]]: one note per day, listing that day's sessions and imported notes.\n"
-        "- [[Writing/README|Writing]]: things you wrote yourself.\n"
-        "- [[Context/README|Context]]: other people's articles, posts and transcripts.\n"
-        "- [[Capabilities/README|Capabilities]]: tools and skills you use, and when.\n"
-        "- [[Agent-Space/README|Agent-Space]]: notes your AI agents keep: lessons, decisions, proposals.\n"
         "- [[Templates/README|Templates]]: note templates with the frontmatter each note type uses.\n"
         "- `Attachments/`: images and files you paste into notes.\n\n"
         "Coldvault never changes notes in your own folders. Delete any folder you don't need."
@@ -1286,15 +1390,14 @@ def _home(folders):
 VAULT_TEMPLATE = {
     "Home.md": _home(FOLDERS),
     "Daily/README.md": _readme("Daily", "One note per day, named `YYYY-MM-DD.md`. Coldvault writes the note for each day with sessions or imported notes and lists them; if you edit it, your version is kept and Coldvault writes its list to `YYYY-MM-DD (Coldvault).md`. Create today's note with the Daily notes command; it uses [[Templates/Daily]]."),
-    "Writing/README.md": _readme("Writing", "Your own writing: drafts, articles, posts and letters. Set `authorship: me` so you can tell your words from imported ones. New notes can start from [[Templates/Note]]."),
+    "Writing/README.md": _readme("Writing", "Keep your own notes, research, drafts, articles, posts, and letters here. Set `authorship: me` so you can tell your words from imported ones. New notes can start from [[Templates/Note]]."),
     "Context/README.md": _readme("Context", "Reference material written by other people: articles, posts and video transcripts. Record where each came from in `source`. Start from [[Templates/Context]]."),
-    "Capabilities/README.md": _readme("Capabilities", "One note per tool, skill or service you rely on: what it does, when to use it and how. Start from [[Templates/Capability]]."),
-    "Agent-Space/README.md": _readme("Agent-Space", "A place for your AI agents to write. Keep a `Notes/<project>.md` per project for lessons and decisions, and put larger plans in `Proposals/`."),
+    "Decisions/README.md": _readme("Decisions", "Record decisions and lessons learned here. Write down what you decided, why, and which project or conversation informed it."),
+    "Archive/README.md": _readme("Archive", "Move older notes and reference material here when you want to keep them for later."),
     "Templates/README.md": _readme("Templates", "Templates for each note type. Obsidian's Templates command inserts them; `{{date}}` and `{{title}}` are filled in for you."),
     "Templates/Daily.md": '---\nrecord_type: daily\ndate: "{{date}}"\nauthorship: me\nprojects: []\n---\n\n# {{date}}\n\n## Notes\n\n## Done\n',
     "Templates/Note.md": '---\nrecord_type: note\ntitle: "{{title}}"\ndate: "{{date}}"\nauthorship: me\nprojects: []\ntags: []\n---\n\n# {{title}}\n',
     "Templates/Context.md": '---\nrecord_type: context\ntitle: "{{title}}"\nsource: \nauthor: \ndate: "{{date}}"\nauthorship: other\nprojects: []\n---\n\n# {{title}}\n\n## Summary\n\n## Notes\n',
-    "Templates/Capability.md": '---\nrecord_type: capability\ntitle: "{{title}}"\nkind: tool\nstatus: active\n---\n\n# {{title}}\n\n## What it does\n\n## When to use it\n\n## How\n',
     ".obsidian/app.json": json.dumps({"attachmentFolderPath": "Attachments", "newLinkFormat": "shortest"}, indent=2) + "\n",
     ".obsidian/core-plugins.json": json.dumps({name: True for name in (
         "file-explorer", "global-search", "switcher", "graph", "backlink", "outgoing-link", "tag-pane",
@@ -1898,14 +2001,14 @@ def _transcript_cache(path):
 
 
 def _short_hash(value):
-    return hashlib.sha1(value.encode()).hexdigest()[:8]
+    return hashlib.sha1(value.encode(), usedforsecurity=False).hexdigest()[:8]
 
 
 def project_slugs(projects):
     slugs, taken, seen = {}, set(), set()
     for key, name in projects:
         unique = base = slug(name)
-        digest = hashlib.sha1((key if name in seen else name).encode()).hexdigest()
+        digest = hashlib.sha1((key if name in seen else name).encode(), usedforsecurity=False).hexdigest()
         seen.add(name)
         length = 8
         while unique in taken:
@@ -2253,7 +2356,7 @@ def _notes(root):
 def _index_folders(root):
     yield root, (".coldvault",)
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    yield cache, ("coldvault", hashlib.sha1(str(root.resolve()).encode()).hexdigest()[:16])
+    yield cache, ("coldvault", hashlib.sha1(str(root.resolve()).encode(), usedforsecurity=False).hexdigest()[:16])
     yield None
 
 

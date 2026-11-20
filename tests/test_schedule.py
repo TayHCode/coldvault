@@ -143,10 +143,9 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(self.crontab.exists())
 
     def test_other_systems_are_refused(self):
-        for platform in ("darwin", "win32"):
-            code, _, err = self.kit("schedule", "--vault", str(self.vault), platform=platform)
-            self.assertEqual(2, code, platform)
-            self.assertIn("Linux only", err)
+        code, _, err = self.kit("schedule", "--vault", str(self.vault), platform="win32")
+        self.assertEqual(2, code)
+        self.assertIn("schedule supports Linux and macOS", err)
         self.assertFalse(self.crontab.exists())
 
     def test_installed_line_builds_the_vault_under_cron_like_environment(self):

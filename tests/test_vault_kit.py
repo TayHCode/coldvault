@@ -24,7 +24,7 @@ import coldvault
 
 SCRATCH = Path(__file__).resolve().parents[1] / ".scratch"
 SCRATCH.mkdir(exist_ok=True)
-TEMPLATE_TOP = [".obsidian", "Agent-Space", "Attachments", "Capabilities", "Context", "Daily", "Home.md", "Templates", "Writing"]
+TEMPLATE_TOP = [".obsidian", "Archive", "Attachments", "Context", "Daily", "Decisions", "Home.md", "Templates", "Writing"]
 GITHUB_USER_REPOS = "https://api.github.com/" + "users/synthetic-user/repos?per_page=100&sort=updated"
 
 
@@ -191,7 +191,7 @@ class VaultKitTests(unittest.TestCase):
                 self.assertIn(f"[[Sessions/{session.stem}]]", (output / f"{project}.md").read_text())
 
     def test_hash_suffixed_slug_never_reuses_a_taken_slug(self):
-        suffix = coldvault.hashlib.sha1("scratch".encode()).hexdigest()[:8]
+        suffix = coldvault.hashlib.sha1("scratch".encode(), usedforsecurity=False).hexdigest()[:8]
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             base = Path(temporary)
             source, output = base / "input", base / "vault"
@@ -582,7 +582,19 @@ class VaultKitTests(unittest.TestCase):
         self.assertNotIn("MIIsynthetic", session)
         self.assertNotIn("hunter2fixture9", session)
         self.assertNotIn("batterystaple", session)
-        for leaked in ("efgh", "horse battery", "hunter2\n", "ret123", "defsecret", "ret456", "linesecret", "ticksecret", "commasecret", ",secret", "abcdef0123456789"):
+        for leaked in (
+            "efgh",
+            "horse battery",
+            "hunter2\n",
+            "ret123",
+            "defsecret",
+            "ret456",
+            "linesecret",
+            "ticksecret",
+            "commasecret",
+            ",secret",
+            "abcdef0123456789",
+        ):
             self.assertNotIn(leaked, session)
         self.assertIn(label + " = " + coldvault.REDACTED, session)
         self.assertIn(kept, session)
@@ -948,7 +960,7 @@ class VaultKitTests(unittest.TestCase):
                 self.run_notes(base, "--notes", str(base / "missing"), "--output", str(base / "vault2"))
 
     def notion_fixture(self):
-        ids = {title: hashlib.md5(title.encode()).hexdigest() for title in ("home", "child", "tasks", "row", "notes-a", "notes-b", "escape")}
+        ids = {title: hashlib.md5(title.encode(), usedforsecurity=False).hexdigest() for title in ("home", "child", "tasks", "row", "notes-a", "notes-b", "escape")}
         home, child, tasks, row = (f"Start {ids['home']}", f"Child (v2) {ids['child']}", f"Tasks {ids['tasks']}", f"Water plants {ids['row']}")
         key = "gh" + "p_" + "Nt7" * 12
 
@@ -1839,7 +1851,7 @@ class IdentityTests(unittest.TestCase):
             ])
             legacy = {}
             for folder, project in (("a", "app"), ("b", "app"), ("c", "kept")):
-                key = coldvault.hashlib.sha1(str((source / folder / "session.jsonl").resolve()).encode()).hexdigest()[:8]
+                key = coldvault.hashlib.sha1(str((source / folder / "session.jsonl").resolve()).encode(), usedforsecurity=False).hexdigest()[:8]
                 legacy[folder] = f"Sessions/2026-11-01-{project}-{key}.md"
                 coldvault.write_note(output, legacy[folder], f"# {project} — 2026-11-01\n\nProject: [[Projects/{project}]]\n\nold text")
             coldvault.write_note(output, "Projects/app.md", "# app\n\n## Sessions\n\n" + "\n".join(f"- {coldvault.link(legacy[f])} (2026-11-01)" for f in "ab"))
@@ -1897,7 +1909,9 @@ class ReadmeTests(unittest.TestCase):
         return cron[0][len("0 * * * * "):], plist, commands[end + 1]
 
     def test_quickstart_downloads_the_script_with_curl_before_any_git_step(self):
-        curl = f"curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/{Path(coldvault.__file__).name}"
+        script = Path(coldvault.__file__)
+        version = coldvault.__version__
+        curl = f"curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v{version}/{script.name}"
         self.assertIn(curl, self.commands)
         first_git = next(i for i, command in enumerate(self.commands) if command.startswith("git "))
         self.assertLess(self.commands.index(curl), first_git)
@@ -1911,7 +1925,7 @@ class ReadmeTests(unittest.TestCase):
         end = self.lines.index(headings[len(path)])
         main = "\n".join(self.lines[start:end])
         self.assertLessEqual(len(main.split()), 800)
-        self.assertIn("    python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault", main)
+        self.assertIn("    python3 ~/coldvault/coldvault.py schedule install --vault ~/ColdvaultVault", main)
         self.assertNotIn("notion-sync", main)
         self.assertNotIn("rclone", main)
 
@@ -2069,12 +2083,25 @@ class VaultTemplateTests(unittest.TestCase):
             session = next(p for p in tree if p.startswith("Sessions/") and p.endswith(".md"))
             self.assertEqual(sorted([
                 ".obsidian/", ".obsidian/app.json", ".obsidian/core-plugins.json", ".obsidian/daily-notes.json", ".obsidian/templates.json",
-                "Agent-Space/", "Agent-Space/README.md", "Attachments/", "Capabilities/", "Capabilities/README.md",
-                "Context/", "Context/README.md", "Daily/", "Daily/README.md", "Home.md", "Index.md",
+                "Archive/", "Archive/README.md", "Attachments/", "Context/", "Context/README.md",
+                "Daily/", "Daily/README.md", "Decisions/", "Decisions/README.md", "Home.md", "Index.md",
                 "Projects/", "Projects/demo.md", "START-HERE.md", "Sessions/", session,
-                "Templates/", "Templates/Capability.md", "Templates/Context.md", "Templates/Daily.md", "Templates/Note.md", "Templates/README.md",
+                "Templates/", "Templates/Context.md", "Templates/Daily.md", "Templates/Note.md", "Templates/README.md",
                 "Writing/", "Writing/README.md",
             ]), tree)
+            home = (output / "Home.md").read_text(encoding="utf-8")
+            for link in (
+                "[[Index#Projects|Projects]]",
+                "[[START-HERE|AI conversations]]",
+                "[[Index#Projects|GitHub repositories]]",
+                "[[Writing/README|Notes and writing]]",
+                "[[Decisions/README|Decisions]]",
+                "[[Context/README|Reference]]",
+                "[[Archive/README|Archive]]",
+            ):
+                self.assertIn(link, home)
+            self.assertNotIn("Agent-Space", home)
+            self.assertNotIn("Capabilities", home)
             app = json.loads((output / ".obsidian/app.json").read_text(encoding="utf-8"))
             self.assertEqual("Attachments", app["attachmentFolderPath"])
             plugins = json.loads((output / ".obsidian/core-plugins.json").read_text(encoding="utf-8"))

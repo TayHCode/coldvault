@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+- On macOS, `schedule install` creates a LaunchAgent for the vault. `status` reads the loaded job and shows the next scheduled run, and `schedule remove` removes the job.
+- New vaults include an `Archive/` folder. `Home.md` links to conversations, projects, daily notes, notes, decisions, reference, and archives. The optional ColdStack guide covers agent-specific folders.
+
 ## 0.2.0
 
 Sync keeps your notes and reports honestly when something goes wrong.
