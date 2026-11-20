@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0
+
+Sync keeps your notes and reports honestly when something goes wrong.
+
+- A missing saved source no longer stops the sync: other sources still import, and the missing one is reported as failed.
+- When a saved Markdown folder or Notion export is unavailable, its earlier notes stay in place and stay linked from `Index.md`. When a saved chat export ZIP is missing or invalid, its earlier conversations stay linked from their project notes, and existing `Daily/` pages stay in place. `status` names the failed source.
+- A sync interrupted by a full disk or a killed process makes `status` exit non-zero, shows the last successful run, and turns green after a successful retry. Syncs for the same vault run one at a time under the same user account.
+- GitHub: an incomplete README, docs or issues refresh keeps the earlier content and is reported in the run receipt. Projects stay listed in `Index.md` through a failed repository listing. After a request failure, the next run resumes from cached docs progress for the same repository revision.
+- Sessions: transcripts that share a day, project and file name stay separate sessions, and moving or renaming a transcript reuses its existing session note. Edited continuations keep later messages on the same session in order, and project notes link every continuation part in order, even after the transcript disappears. Renaming the sessions folder keeps edited sessions linked, and a session whose transcript has expired stays linked in `Daily/`.
+- `setup` saves ChatGPT and Claude.ai export ZIP paths, so a scheduled `sync --vault` rereads them. An explicit `--chatgpt-export` or `--claude-export` replaces that provider's saved list for one run.
+- Imported Markdown notes record their source path in `coldvault-source-path`, and reruns keep their import time.
+- On supported platforms, Coldvault refuses a generated-note write when it detects that the parent folder changed during the write; a retry writes inside the selected vault.
+- On Linux, `status` reads the vault's tagged crontab line, tells a missing line apart from an unreadable crontab, and reports when the due time is uncertain. `schedule` replaces the tagged line in place, keeping the cron settings around it.
+- Docs: how the saved schedule interval works, and an opt-in way to back up and restore chosen original transcripts outside the vault.
+
 ## 0.1.0
 
 First tagged release.

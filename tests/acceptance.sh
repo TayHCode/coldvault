@@ -43,7 +43,7 @@ else
        "curl -O https://raw.githubusercontent.com/TayHCode/coldvault/main/coldvault.py"
 fi
 
-printf '%s\n' "$home/ColdvaultVault" '' '' '' '' '' | step "cd ~/coldvault" "python3 coldvault.py setup"
+printf '%s\n' "$home/ColdvaultVault" '' '' '' '' '' '' '' | step "cd ~/coldvault" "python3 coldvault.py setup"
 step "python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault"
 
 runs=$home/ColdvaultVault/.coldvault/runs.jsonl

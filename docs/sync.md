@@ -46,3 +46,32 @@ Then rebuild into it:
     python3 "$HOME/coldvault/coldvault.py" --username '' --output "$HOME/ColdvaultVault"
 
 With Obsidian Sync, run the Obsidian Sync commands above in a new empty folder. With iCloud, the vault is already on every device signed in to your iCloud account. Both also sync `.coldvault/`, so build the vault on one machine only and just open it in Obsidian on the others. Run `setup` on a new machine only when it replaces the old one.
+
+## Back up and restore original transcripts
+
+This is an opt-in, manual backup. Coldvault setup and sync leave originals at their source. Back up only the files you choose before the source deletes them. The copies contain the full, unredacted originals.
+
+1. Choose a finished transcript and a new backup directory outside the source, the vault, and any shared or synced folder. Use a destination that supports Unix file permissions. Set the paths below for your file and destination. The directory mode `700` and file mode `600` restrict access to your account. Use a different backup directory for each chosen file or version.
+
+   ```sh
+   source_file="$HOME/path/to/session.jsonl"
+   backup_dir="$HOME/private-transcript-backup-session-1"
+   name="${source_file##*/}"
+   mkdir -m 700 "$backup_dir" &&
+     install -m 600 "$source_file" "$backup_dir/$name" &&
+     (umask 077 && sha256sum < "$source_file" > "$backup_dir/original.sha256") &&
+     sha256sum -c "$backup_dir/original.sha256" < "$backup_dir/$name"
+   ```
+
+2. To restore the file later, use the same backup path and the original file name. Choose a new private restore directory. The last command checks the restored file against the SHA-256 saved from the source. A match prints `-: OK`.
+
+   ```sh
+   backup_dir="$HOME/private-transcript-backup-session-1"
+   restore_dir="$HOME/restored-transcript"
+   name="session.jsonl"
+   mkdir -m 700 "$restore_dir" &&
+     install -m 600 "$backup_dir/$name" "$restore_dir/$name" &&
+     sha256sum -c "$backup_dir/original.sha256" < "$restore_dir/$name"
+   ```
+
+On macOS, use `shasum -a 256` in place of `sha256sum` in both steps.

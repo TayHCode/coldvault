@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,7 @@ try:
 except ImportError:
     sqlite3 = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def slug(value):
@@ -141,11 +142,13 @@ def transcript_info(path):
     if not lines:
         return None
     day = next((d for d in dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)), "undated")
-    return project, day, "\n\n".join(lines), source, session_id or path.stem
+    return project, day, "\n\n".join(lines), source, session_id
 
 
 class SourceError(Exception):
-    pass
+    def __init__(self, reason, *, notes=()):
+        super().__init__(reason)
+        self.notes = notes
 
 
 _GITHUB_API = "https://api.github.com/"
@@ -174,6 +177,12 @@ def _github_error(error, token):
     return SourceError(redact(str(error).replace(token, "[REDACTED]") if token else str(error)))
 
 
+class GitHubListingError(SourceError):
+    def __init__(self, error, token, repos):
+        super().__init__(f"incomplete repository listing ({_github_error(error, token)})")
+        self.repos = repos
+
+
 def github_repos(username):
     if not username:
         return []
@@ -190,8 +199,8 @@ def github_repos(username):
             match = re.search(r'<(https://api\.github\.com/[^>]*)>;\s*rel="next"', headers.get("Link") or "")
             url = match and match.group(1)
         return repos
-    except (OSError, URLError, ValueError) as error:
-        raise _github_error(error, token) from None
+    except (OSError, URLError, ValueError, SourceError) as error:
+        raise GitHubListingError(error, token, repos) from None
 
 
 _SOURCES = {"user": "claude-code", "assistant": "claude-code", "session_meta": "codex", "response_item": "codex", "event_msg": "codex"}
@@ -324,10 +333,62 @@ def _unchanged(root, relative, rendered):
 def _write_rendered(root, relative, rendered):
     if _unchanged(root, relative, rendered):
         return relative
-    target = note_target(root, relative)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(target, rendered)
+    if not hasattr(os, "O_NOFOLLOW") or os.rename not in os.supports_dir_fd:
+        target = note_target(root, relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(target, rendered)
+        return target.relative_to(root).as_posix()
+
+    base = root.resolve()
+    parent = (root / relative).parent
+    resolved = parent.resolve()
+    if not _inside(base, resolved):
+        raise ValueError("A note path escaped the chosen vault folder")
+    with _note_directory(base, resolved) as directory:
+        target = note_target(root, relative)
+        _check_note_directory(parent, resolved, directory)
+        temporary = f".coldvault-{uuid.uuid4().hex}"
+        handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(rendered)
+            _check_note_directory(parent, resolved, directory)
+            os.replace(temporary, target.name, src_dir_fd=directory, dst_dir_fd=directory)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=directory)
+            raise
     return target.relative_to(root).as_posix()
+
+
+@contextlib.contextmanager
+def _note_directory(base, parent):
+    flags = getattr(os, "O_SEARCH", getattr(os, "O_PATH", os.O_RDONLY)) | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        directory = os.open(base, flags)
+    except FileNotFoundError:
+        base.mkdir(parents=True, exist_ok=True)
+        directory = os.open(base, flags)
+    try:
+        for part in parent.relative_to(base).parts:
+            try:
+                child = os.open(part, flags, dir_fd=directory)
+            except FileNotFoundError:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, dir_fd=directory)
+                child = os.open(part, flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        yield directory
+    finally:
+        os.close(directory)
+
+
+def _check_note_directory(parent, resolved, directory):
+    if parent.resolve() != resolved or not os.path.samestat(
+        resolved.lstat(), os.fstat(directory)
+    ):
+        raise OSError("A note's parent directory changed during the write")
 
 
 def _current_text(path):
@@ -347,6 +408,14 @@ def _atomic_write(target, text):
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+
+
+def _sync_path(path, flags):
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def link(relative):
@@ -393,26 +462,26 @@ def _config_path(root):
     return root / ".coldvault" / "config.json"
 
 
-def _check_sources(parser, root, notes, notion_exports, transcripts, chat_exports=()):
+def _check_sources(root, notes=(), notion_exports=(), transcripts=(), chat_exports=()):
     for folder in notes:
         path = Path(folder).expanduser().resolve()
         if not path.is_dir():
-            parser.error(f"notes folder not found: {folder}")
+            raise SourceError(f"notes folder not found: {folder}")
         if path == root or root in path.parents:
-            parser.error(f"choose a notes folder outside the vault: {folder}")
+            raise SourceError(f"choose a notes folder outside the vault: {folder}")
     for export in notion_exports:
         path = Path(export).expanduser().resolve()
         if path.is_dir():
             if path == root or root in path.parents:
-                parser.error(f"choose a Notion export outside the vault: {export}")
+                raise SourceError(f"choose a Notion export outside the vault: {export}")
         elif not zipfile.is_zipfile(path):
-            parser.error(f"Notion export must be a .zip file or an unzipped folder: {export}")
+            raise SourceError(f"Notion export must be a .zip file or an unzipped folder: {export}")
     for export in chat_exports:
         if not zipfile.is_zipfile(Path(export).expanduser()):
-            parser.error(f"ChatGPT and Claude.ai exports must be the downloaded .zip file: {export}")
+            raise SourceError(f"ChatGPT and Claude.ai exports must be the downloaded .zip file: {export}")
     for folder in transcripts:
         if not Path(folder).expanduser().is_dir():
-            parser.error(f"transcript folder not found: {folder}")
+            raise SourceError(f"transcript folder not found: {folder}")
 
 
 FOLDERS = {"projects": "Projects", "sessions": "Sessions", "imported": "Imported"}
@@ -440,10 +509,12 @@ def _load_config(parser, root):
         config = json.loads(_read(path))
     except (OSError, UnicodeError, ValueError) as error:
         parser.error(f"cannot read {path}: {error}")
-    lists = ("transcripts", "notes", "notion_exports")
+    lists = {"transcripts": None, "notes": None, "notion_exports": None, "chatgpt_exports": [], "claude_exports": []}
     if (not isinstance(config, dict) or type(config.get("version")) is not int or config["version"] != 1
             or not isinstance(config.get("username"), str)
-            or not all(isinstance(config.get(key), list) and all(isinstance(item, str) and item and "\0" not in item for item in config[key]) for key in lists)
+            or not all(isinstance(paths := config.get(key, default), list)
+                       and all(isinstance(item, str) and item and "\0" not in item for item in paths)
+                       for key, default in lists.items())
             or ("schedule_hours" in config and (type(config["schedule_hours"]) is not int or config["schedule_hours"] < 1))
             or ("folders" in config and not _valid_folders(config["folders"]))):
         parser.error(f"{path} is not a Coldvault config; move it aside, then run setup")
@@ -482,11 +553,25 @@ def sync_main(argv):
     if not output:
         parser.error("choose an output folder")
     root = Path(output).expanduser().resolve()
+    try:
+        attempt = _start_attempt(root)
+    except OSError as error:
+        parser.error(f"cannot record the start of this run: {error}")
+    with attempt:
+        _sync(parser, args, config, root, username, notes, notion_exports, attempt.fileno())
+
+
+def _sync(parser, args, config, root, username, notes, notion_exports, attempt):
     started = _utc_now()
+
+    def record(sources):
+        _record_run(root, started, sources)
+        os.ftruncate(attempt, 0)
+
     if root.is_dir():
         def refuse(message):
             with contextlib.suppress(OSError):
-                _record_run(root, started, {"sources": {"state": "failed", "reason": message}})
+                record({"sources": {"state": "failed", "reason": message}})
             argparse.ArgumentParser.error(parser, message)
         parser.error = refuse
     folders = {**FOLDERS, **(config.get("folders", {}) if config else {})}
@@ -496,32 +581,40 @@ def sync_main(argv):
     crossed = _crossed_folder(previous, folders)
     if crossed:
         parser.error(f"'{folders[crossed]}' is still another generated folder; rename it to a new name first, sync, then rename {crossed} to '{folders[crossed]}'")
-    _check_sources(parser, root, notes, notion_exports, [args.transcripts] if args.transcripts else config["transcripts"] if config else [], args.chatgpt_export + args.claude_export)
+    try:
+        _check_sources(root, args.notes, args.notion_export, [args.transcripts] if args.transcripts else [],
+                       args.chatgpt_export + args.claude_export)
+    except SourceError as error:
+        parser.error(str(error))
+    transcript_folders = ()
     if args.transcripts:
         files = sorted(Path(args.transcripts).expanduser().rglob("*.jsonl"))
         if not files:
             parser.error(f"no transcripts (*.jsonl) found in {args.transcripts}")
     elif config:
-        files = [p for folder in config["transcripts"] for p in Path(folder).expanduser().rglob("*.jsonl")]
-    elif imports:
+        files, transcript_folders = [], config["transcripts"]
+    elif notes or notion_exports or args.chatgpt_export or args.claude_export:
         files = []
     else:
         files = [p for folder in _standard_transcript_folders() if folder.is_dir() for p in folder.rglob("*.jsonl")]
         if not files and not username:
             parser.error("no transcripts found in ~/.claude/projects, ~/.codex/sessions or ~/.codex/archived_sessions; pass --transcripts DIR, --notes DIR, --notion-export ZIP, --chatgpt-export ZIP or --claude-export ZIP")
+    chatgpt_exports = args.chatgpt_export or (config or {}).get("chatgpt_exports", [])
+    claude_exports = args.claude_export or (config or {}).get("claude_exports", [])
     try:
-        sources = build_from_files(files, output, username, notes, notion_exports, folders, args.chatgpt_export, args.claude_export)
+        sources = build_from_files(files, root, username, notes, notion_exports, folders,
+                                   chatgpt_exports, claude_exports, transcript_folders=transcript_folders)
     except OSError as error:
         detail = f"{error.filename}: {error.strerror}" if error.filename else str(error)
         print(f"{parser.prog}: error: {detail}", file=sys.stderr)
         with contextlib.suppress(OSError):
-            _record_run(root, started, {"vault": {"state": "failed", "reason": detail}})
+            record({"vault": {"state": "failed", "reason": detail}})
         sys.exit(2)
     failed = [f"{name}: failed ({source['reason']})" for name, source in sources.items() if source["state"] == "failed"]
     for line in failed:
         print(line, file=sys.stderr)
     try:
-        _record_run(root, started, sources)
+        record(sources)
     except OSError as error:
         print(f"{parser.prog}: error: cannot record this run: {error}", file=sys.stderr)
         sys.exit(2)
@@ -534,6 +627,49 @@ _HISTORY = "runs.jsonl"
 _STATES = ("ok", "failed", "skipped")
 
 
+def _attempt_path(root):
+    key = hashlib.sha256(os.fsencode(root)).hexdigest()
+    return Path.home() / ".cache" / "coldvault" / "sync" / key
+
+
+def _start_attempt(root):
+    import fcntl
+
+    path = _attempt_path(root)
+    _owned_folder(path.parents[2], ("coldvault", "sync"))
+    if path.is_symlink():
+        raise OSError(f"{path} is a symlink")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
+    attempt = os.fdopen(os.open(path, flags, 0o600), "r+b")
+    try:
+        descriptor = attempt.fileno()
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"{path} is not a plain file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.ftruncate(descriptor, 1)
+        os.fsync(descriptor)
+        _sync_path(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        return attempt
+    except BaseException:
+        attempt.close()
+        raise
+
+
+def _attempt_problem(root):
+    path = _attempt_path(root)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"cannot read the sync attempt: {error}"
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return f"cannot read the sync attempt: {path} is not a plain file"
+    if info.st_size:
+        return "sync attempt did not finish; run coldvault sync again if it is no longer running"
+
+
 def _record_run(root, started, sources):
     folder = _owned_folder(root, (".coldvault",))
     ok = all(source["state"] != "failed" for source in sources.values())
@@ -541,16 +677,28 @@ def _record_run(root, started, sources):
     previous = _receipt(folder / _RECEIPT)
     last_success = finished if ok else previous["last_success"] if isinstance(previous, dict) else None
     receipt = {"version": 1, "started": started, "finished": finished, "ok": ok, "last_success": last_success, "sources": sources}
-    line = json.dumps(receipt, ensure_ascii=False)
+    line = json.dumps(receipt, ensure_ascii=False) + "\n"
     try:
-        with open(folder / _HISTORY, "a", encoding="utf-8", opener=lambda path, flags: os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)) as stream:
-            stream.write(line + "\n")
+        with open(folder / _HISTORY, "a+b", opener=lambda path, flags: os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)) as stream:
+            if stream.seek(0, os.SEEK_END):
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b"\n":
+                    stream.write(b"\n")
+            stream.write(line.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
     except OSError as error:
         sources = {**sources, "history": {"state": "failed", "reason": f"cannot append to {_HISTORY}: {error.strerror or error}"}}
         receipt.update(ok=False, last_success=previous["last_success"] if isinstance(previous, dict) else None, sources=sources)
-        _atomic_write(folder / _RECEIPT, json.dumps(receipt, ensure_ascii=False) + "\n")
+        _write_receipt(folder / _RECEIPT, json.dumps(receipt, ensure_ascii=False) + "\n")
         raise
-    _atomic_write(folder / _RECEIPT, line + "\n")
+    _write_receipt(folder / _RECEIPT, line)
+
+
+def _write_receipt(path, line):
+    _atomic_write(path, line)
+    _sync_path(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    _sync_path(path.parent, os.O_RDONLY | os.O_DIRECTORY)
 
 
 def _when(value):
@@ -591,7 +739,7 @@ def _last_line(path):
     try:
         with open(path, "rb") as stream:
             stream.seek(max(0, stream.seek(0, os.SEEK_END) - 65536))
-            return json.loads(stream.read().decode("utf-8").splitlines()[-1])
+            return json.loads(stream.read().removesuffix(b"\n").rsplit(b"\n", 1)[-1].decode("utf-8"))
     except (OSError, UnicodeError, ValueError, IndexError):
         return None
 
@@ -610,27 +758,32 @@ def status_main(argv, now=None):
     hours = config.get("schedule_hours") if config else None
     receipt = _receipt(root / ".coldvault" / _RECEIPT)
     history = root / ".coldvault" / _HISTORY
+    attempt_problem = _attempt_problem(root)
+    if attempt_problem:
+        print(attempt_problem)
     if history.is_symlink():
         receipt = f"cannot record runs: {history} is a symlink; move it aside"
     elif isinstance(receipt, dict) and receipt["ok"] and _last_line(history) != receipt:
-        receipt = f"cannot read the last run: {_RECEIPT} does not match the last line of {history}"
+        print(f"cannot read the last run: {_RECEIPT} does not match the last line of {history}")
+        if not attempt_problem:
+            return 1
     now = now or datetime.now(timezone.utc)
-    schedule = f"schedule: installed, next run due {_next_run(now, hours, _cron_zone())} (every {hours}h)" if hours else "schedule: not installed"
     if receipt is None:
         print(f"no run recorded in {root}; run: coldvault sync --vault {root}")
-        print(schedule)
+        print(_schedule_status(root, hours, now))
         return 1
     if isinstance(receipt, str):
         print(receipt)
         return 1
-    healthy = receipt["ok"]
-    print(f"last run: {receipt['finished']} ({_age(_when(receipt['finished']), now)}), {'ok' if healthy else 'failed'}")
+    healthy = receipt["ok"] and not attempt_problem
+    label = "last completed run" if attempt_problem else "last run"
+    print(f"{label}: {receipt['finished']} ({_age(_when(receipt['finished']), now)}), {'ok' if receipt['ok'] else 'failed'}")
     for name, source in receipt["sources"].items():
         detail = source.get("reason") if source["state"] == "failed" else source.get("count")
         print(f"{name}: {source['state']}" + (f" ({detail})" if detail is not None else ""))
     success = receipt["last_success"] and _when(receipt["last_success"])
     print(f"last success: {receipt['last_success']} ({_age(success, now)})" if success else "last success: never")
-    print(schedule)
+    print(_schedule_status(root, hours, now))
     if hours and (not success or now - success > timedelta(hours=2 * hours)):
         print(f"stale: no successful run in the last {2 * hours}h")
         healthy = False
@@ -653,43 +806,103 @@ def _cron_zone():
         return None
 
 
-def _next_run(now, hours, zone=None):
+def _next_run(now, hours, zone):
+    if zone is None:
+        return "unknown"
     moment = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    offset_before = (moment - timedelta(hours=3)).astimezone(zone).utcoffset()
     for _ in range(26 * 60):
         moment += timedelta(minutes=1)
         local = moment.astimezone(zone)
+        if hours == 24 and local.utcoffset() != offset_before:
+            return "unknown"
         if local.minute == 0 and local.hour % hours == 0:
             return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
     return "unknown"
 
 
-def _run(parser, command, stdin="", missing_ok=None):
+def _cron_hour(hours):
+    return "*" if hours == 1 else "0" if hours == 24 else f"*/{hours}"
+
+
+def _cron_command(root):
+    command = [sys.executable, str(Path(__file__).resolve()), "sync", "--vault", str(root)]
+    return " ".join(map(shlex.quote, command)).replace("%", "\\%")
+
+
+def _schedule_status(root, expected_hours, now):
+    expected = f" (expected every {expected_hours}h)" if expected_hours else ""
+    if sys.platform != "linux":
+        return f"schedule: installation unverified{expected}"
+    try:
+        text = _run(["crontab", "-l"], missing_ok="no crontab")
+    except OSError:
+        return f"schedule: unknown{expected}"
+    tag = _CRON_TAG + _schedule_id(root)
+    entries = []
+    has_timezone_override = False
+    for entry in text.split("\n"):
+        entry = entry.strip()
+        if re.match(r"""(['"]?)CRON_TZ\1[ \t]*=""", entry):
+            has_timezone_override = True
+        if not entry.endswith(tag):
+            continue
+        fields = entry.removesuffix(tag).rstrip().split(maxsplit=5)
+        if len(fields) >= 2 and fields[0].startswith("@") and not fields[1].startswith("#"):
+            entries.append((fields, has_timezone_override))
+        elif len(fields) == 6 and fields[0][0] in "0123456789*" and not fields[-1].startswith("#"):
+            entries.append((fields, has_timezone_override))
+    if not entries:
+        return f"schedule: installation unverified{expected}" if expected_hours else "schedule: not installed"
+    if len(entries) == 1:
+        fields, has_timezone_override = entries[0]
+        if has_timezone_override:
+            return "schedule: installed, next run due unknown (CRON_TZ is set above this entry)"
+        for hours in _SCHEDULE_HOURS:
+            if fields[:5] == ["0", _cron_hour(hours), "*", "*", "*"]:
+                if fields[-1] != _cron_command(root):
+                    return "schedule: installed, next run due unknown (crontab command differs from this Coldvault command)"
+                return f"schedule: installed, next run due {_next_run(now, hours, _cron_zone())} (every {hours}h)"
+    return "schedule: installed, next run due unknown"
+
+
+def _run(command, stdin="", missing_ok=None):
     try:
         result = subprocess.run(command, input=stdin.encode("utf-8", "surrogateescape"), capture_output=True)
     except OSError as error:
-        parser.error(f"cannot run {command[0]}: {error}")
+        raise OSError(f"cannot run {command[0]}: {error}") from error
     stderr = result.stderr.decode("utf-8", "replace").strip()
     if result.returncode and not (missing_ok and missing_ok in stderr.lower()):
-        parser.error(f"{' '.join(command)} failed: {stderr or result.returncode}")
+        raise OSError(f"{' '.join(command)} failed: {stderr or result.returncode}")
     return result.stdout.decode("utf-8", "surrogateescape") if result.returncode == 0 else ""
 
 
 def _edit_crontab(parser, root, line=None):
     tag = _CRON_TAG + _schedule_id(root)
-    text = _run(parser, ["crontab", "-l"], missing_ok="no crontab")
+    text = _run(["crontab", "-l"], missing_ok="no crontab")
     lines = text.split("\n")[:-1] if text.endswith("\n") else text.split("\n") if text else []
-    kept = [entry for entry in lines if not entry.endswith(tag)]
-    if line is None and len(kept) == len(lines):
+    kept = []
+    replaced = 0
+    for entry in lines:
+        if entry.rstrip().endswith(tag):
+            if replaced == 0 and line is not None:
+                kept.append(line)
+            replaced += 1
+        else:
+            kept.append(entry)
+    if line is None and not replaced:
         return 0
-    if _run(parser, ["crontab", "-l"], missing_ok="no crontab") != text:
+    if line is not None and not replaced:
+        kept.append(line)
+    if _run(["crontab", "-l"], missing_ok="no crontab") != text:
         parser.error("your crontab changed while Coldvault was editing it; run the command again")
-    _run(parser, ["crontab", "-"], "".join(entry + "\n" for entry in kept + ([line] if line else [])))
-    return len(lines) - len(kept)
+    _run(["crontab", "-"], "".join(entry + "\n" for entry in kept))
+    return replaced
 
 
 def _install_cron(parser, root, command, hours):
-    hour = "*" if hours == 1 else "0" if hours == 24 else f"*/{hours}"
-    line = f"0 {hour} * * * {' '.join(map(shlex.quote, command)).replace('%', chr(92) + '%')} {_CRON_TAG}{_schedule_id(root)}"
+    hour = _cron_hour(hours)
+    line = f"0 {hour} * * * {command} {_CRON_TAG}{_schedule_id(root)}"
     replaced = _edit_crontab(parser, root, line)
     print(f"{'Replaced' if replaced else 'Added'} crontab line: {line}")
 
@@ -726,8 +939,8 @@ def _schedule_locked(parser, args):
     config = _load_config(parser, root)
     if config is None:
         parser.error(f"no saved config in {root}; run: coldvault setup")
-    command = [sys.executable, str(Path(__file__).resolve()), "sync", "--vault", str(root)]
-    if any("\n" in part or "\r" in part for part in command):
+    command = _cron_command(root)
+    if "\n" in command or "\r" in command:
         parser.error("cannot schedule a path that contains a line break")
     saved = json.dumps(config, indent=2) + "\n"
     config.pop("schedule_hours", None)
@@ -796,8 +1009,14 @@ def setup_main(argv):
     notes = ask_many("Markdown notes folder to import (Enter to finish): ")
     notion_exports = ask_many("Notion export .zip or folder to import (Enter to finish): ")
     username = ask("GitHub username (optional): ")
-    _check_sources(parser, root, notes, notion_exports, transcripts)
-    config = {"version": 1, "transcripts": transcripts, "notes": notes, "notion_exports": notion_exports, "username": username}
+    chatgpt_exports = ask_many("ChatGPT export .zip to import (Enter to finish): ")
+    claude_exports = ask_many("Claude.ai export .zip to import (Enter to finish): ")
+    try:
+        _check_sources(root, notes, notion_exports, transcripts, chatgpt_exports + claude_exports)
+    except SourceError as error:
+        parser.error(str(error))
+    config = {"version": 1, "transcripts": transcripts, "notes": notes, "notion_exports": notion_exports,
+              "chatgpt_exports": chatgpt_exports, "claude_exports": claude_exports, "username": username}
     for key in ("folders", "schedule_hours"):
         if saved and key in saved:
             config[key] = saved[key]
@@ -811,7 +1030,10 @@ def setup_main(argv):
 
 
 def markdown_files(source, vault, suffixes=(".md",)):
-    for folder, dirs, names in os.walk(source):
+    def onerror(error):
+        raise error
+
+    for folder, dirs, names in os.walk(source, onerror=onerror):
         dirs[:] = sorted(d for d in dirs if not d.startswith(".") and (Path(folder) / d).resolve() != vault)
         for name in sorted(names):
             path = Path(folder) / name
@@ -831,23 +1053,55 @@ def _import_folders(run):
     return list(zip(sources, folders)), list(zip(exports, folders[len(sources):]))
 
 
+def _saved_import_notes(run, imports):
+    index = note_target(run.root, "Index.md")
+    if not _is_managed_note(index):
+        return []
+    previous, _ = _previous_folders(run.root)
+    prefixes = {run.root / folders["imported"] / name
+                for folders in (previous, run.folders) for _, name in imports}
+    section = _read(index).partition("\n## Imported notes\n\n")[2]
+    notes = []
+    for target in re.findall(r"^- \[\[([^\n]+)\]\]$", section, re.MULTILINE):
+        path = run.root / f"{target}.md"
+        if prefixes.intersection(path.parents) and path.is_file() and path.resolve() == path:
+            notes.append((path.relative_to(run.root).as_posix(), "", {"kind": "note", "kept": True}))
+    return notes
+
+
 def notes_source(run):
     if not run.notes:
         return None
+    imports, _ = _import_folders(run)
     notes = []
-    for source, folder in _import_folders(run)[0]:
-        for path in markdown_files(source, run.root):
-            text = redact(path.read_text(encoding="utf-8-sig", errors="replace"))
-            notes.append((f"{run.folders['imported']}/{folder}/{path.relative_to(source).as_posix()}", text, {"kind": "note"}))
+    try:
+        _check_sources(run.root, notes=run.notes)
+        for source, folder in imports:
+            for path in markdown_files(source, run.root):
+                text = redact(path.read_text(encoding="utf-8-sig", errors="replace"))
+                relative = f"{folder}/{path.relative_to(source).as_posix()}"
+                field = "coldvault-source-path"
+                if not _has_frontmatter(text):
+                    text = _frontmatter({field: json.dumps(redact(relative))}) + text
+                elif all(_field(text, key) is None for key in (field, f'"{field}"', f"'{field}'")):
+                    text = f"---\n{field}: {json.dumps(redact(relative))}\n{text[4:]}"
+                notes.append((f"{run.folders['imported']}/{relative}", text, {"kind": "note"}))
+    except (SourceError, OSError) as error:
+        raise SourceError(str(error), notes=_saved_import_notes(run, imports)) from None
     return notes
 
 
 def notion_source(run):
     if not run.notion_exports:
         return None
-    return [(note, text, {"kind": "note", "source": "notion"})
-            for export, folder in _import_folders(run)[1]
-            for note, text in notion_notes(export, run.root, f"{run.folders['imported']}/{folder}")]
+    _, imports = _import_folders(run)
+    try:
+        _check_sources(run.root, notion_exports=run.notion_exports)
+        return [(note, text, {"kind": "note", "source": "notion"})
+                for export, folder in imports
+                for note, text in notion_notes(export, run.root, f"{run.folders['imported']}/{folder}")]
+    except (SourceError, OSError, zipfile.BadZipFile) as error:
+        raise SourceError(str(error), notes=_saved_import_notes(run, imports)) from None
 
 
 _NOTION_ID = re.compile(r"(?:^|\s)([0-9a-f]{32})$")
@@ -1075,13 +1329,17 @@ def _unbuilt(root):
 
 
 def transcript_source(run):
+    _check_sources(run.root, transcripts=run.transcript_folders)
+    files = run.files
+    if run.transcript_folders:
+        files = [p for folder in run.transcript_folders for p in Path(folder).expanduser().rglob("*.jsonl")]
     sessions = {}
     try:
         cache_path = _owned_folder(run.root, (".coldvault",)) / "transcripts.json"
     except OSError:
         cache_path = None
     cached, parsed = _transcript_cache(cache_path) if cache_path else {}, {}
-    for path in sorted(run.files):
+    for path in sorted(files):
         status = path.stat()
         stamp = f"{status.st_size} {status.st_mtime_ns} {status.st_ctime_ns} {status.st_ino}"
         source = str(path.resolve())
@@ -1092,36 +1350,57 @@ def transcript_source(run):
             continue
         (project, name), day, text, source, session_id = info
         path_key = _short_hash(str(path.resolve()))
-        key = _short_hash(f"{project}\n{path.stem}")
+        project_key = _short_hash(f"{project}\n{path.stem}")
+        key = (source, session_id) if session_id else project_key
         earlier = sessions.get(key)
-        if earlier and not (earlier[1].startswith(text) or text.startswith(earlier[1])):
-            key = path_key
+        if earlier and (earlier[2]["source"] != source or not _same_transcript(earlier[1], text)):
+            key = (source, session_id, path_key) if session_id else path_key
             earlier = sessions.get(key)
-        legacy = [f"{run.folders['sessions']}/{day}-{slug(name)}-{path_key}.md", *(earlier[2]["legacy"] if earlier else ())]
+        prefix = f"{run.folders['sessions']}/{day}-{slug(name)}"
+        legacy = [f"{prefix}-{path_key}.md", *(earlier[2]["legacy"] if earlier else ())]
+        previous_paths = [f"{prefix}-{project_key}.md", *(earlier[2]["previous-paths"] if earlier else ())]
         if earlier and len(earlier[1]) >= len(text):
             earlier[2]["legacy"] = legacy
+            earlier[2]["previous-paths"] = previous_paths
         else:
-            sessions[key] = (f"{run.folders['sessions']}/{day}-{slug(name)}-{key}.md", text, {
+            digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16] if session_id else key
+            sessions[key] = (f"{prefix}-{digest}.md", text, {
                 "kind": "session", "project": (project, name), "date": day,
-                "source": source, "session-id": session_id, "legacy": legacy})
+                "source": source, "session-id": session_id or path.stem, "legacy": legacy,
+                "session-id-fallback": "false" if session_id else "true", "previous-paths": previous_paths})
     if cache_path and parsed != cached:
         with contextlib.suppress(OSError):
             _atomic_write(cache_path, json.dumps({"tag": _CACHE_TAG, "files": parsed}, ensure_ascii=False))
-    return list(sessions.values()) if run.files else None
+    return list(sessions.values()) if files else None
 
 
 def github_source(run):
     if not run.username:
         return None
     token = _github_token()
-    repos = github_repos(run.username)
     try:
         cache_path = _owned_folder(run.root, (".coldvault",)) / "github.json"
     except OSError:
         cache_path = None
-    cached = _github_cache(cache_path) if cache_path else {}
-    kept, limited, notes = {}, False, []
-    for repo in repos:
+    saved = _github_cache(cache_path) if cache_path else {}
+    username = run.username.casefold()
+    matching_user = saved.get("username") == username
+    cached = saved.get("repos", {}) if matching_user else {}
+    inventory = _github_inventory(saved.get("inventory"), username) if matching_user else {}
+    had_complete = matching_user and saved.get("complete") is True
+    listing_failure = ""
+    try:
+        observed = _github_inventory(github_repos(run.username), username)
+    except GitHubListingError as error:
+        observed = _github_inventory(error.repos, username)
+        listing_failure = str(error)
+        inventory.update(observed)
+    else:
+        inventory = observed
+    kept, limited, notes = {}, False, {}
+    refreshed = set()
+    failure = ""
+    for identity, repo in inventory.items():
         full_name, pushed = repo.get("full_name"), repo.get("pushed_at")
         metadata = {"kind": "repo", "project": repo["name"], "repo": json.dumps(full_name if isinstance(full_name, str) else str(repo["name"]))}
         if _is_timestamp(pushed):
@@ -1129,27 +1408,94 @@ def github_source(run):
         text = f"GitHub: [{repo['html_url']}]({repo['html_url']})\n\n{repo.get('description') or ''}\n\n"
         if isinstance(full_name, str) and _REPO_NAME.fullmatch(full_name):
             entry = cached.get(full_name)
-            if not limited:
+            if identity in observed and not limited:
                 entry = dict(entry or {"pushed-at": "", "docs": "", "issues": "", "etag": ""})
                 try:
                     _github_repo_content(full_name, repo, token, entry)
                 except (OSError, URLError, ValueError) as error:
                     limited = isinstance(error, HTTPError) and (error.code == 429 or (error.headers or {}).get("X-RateLimit-Remaining") == "0")
                     if not limited:
-                        print(f"GitHub: kept the saved README and issues of {full_name} ({_github_error(error, token)})", file=sys.stderr)
+                        detail = _github_error(error, token)
+                        failure = failure or f"incomplete repository content ({detail})"
+                        print(f"GitHub: kept the saved README and issues of {full_name} ({detail})", file=sys.stderr)
+                else:
+                    refreshed.add(identity)
             if entry:
                 kept[full_name] = entry
-                text += "".join(f"{section}\n\n" for section in (entry["docs"], entry["issues"]) if section)
-        notes.append((f"{run.folders['projects']}/{repo['name']}.md", text, metadata))
+                docs = entry["docs"]
+                if not entry["pushed-at"] and not docs and "pending-docs" in entry:
+                    docs = _github_doc_text(entry["pending-docs"]["sections"])
+                text += "".join(f"{section}\n\n" for section in (docs, entry["issues"]) if section)
+        notes[identity] = (f"{run.folders['projects']}/{repo['name']}.md", text, metadata)
     if limited:
-        print("GitHub rate limit reached: some READMEs and issue lists wait for the next run (GITHUB_TOKEN raises the limit)", file=sys.stderr)
-    if cache_path and kept != cached:
+        failure = "GitHub rate limit reached: some READMEs and issue lists wait for the next run (GITHUB_TOKEN raises the limit)"
+    if (listing_failure or failure) and (matching_user or "username" not in saved):
+        for name, note in _saved_github_notes(run):
+            if name not in refreshed and (name in notes or (listing_failure and not had_complete)):
+                notes[name] = note
+    updated = {"version": 1, "username": username, "complete": had_complete or not listing_failure,
+               "inventory": list(inventory.values()), "repos": kept}
+    if cache_path and updated != saved:
         with contextlib.suppress(OSError):
-            _atomic_write(cache_path, json.dumps({"tag": _CACHE_TAG, "repos": kept}, ensure_ascii=False))
-    return notes
+            _atomic_write(cache_path, json.dumps(updated, ensure_ascii=False))
+    failure = "; ".join(filter(None, (listing_failure, failure)))
+    if failure:
+        raise SourceError(failure, notes=list(notes.values()))
+    return list(notes.values())
 
 
 _REPO_NAME = re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
+_GITHUB_DOC_NAME = re.compile(r"[^/\\]+\.md", re.IGNORECASE)
+
+
+def _github_inventory(rows, username):
+    inventory = {}
+    for row in rows if isinstance(rows, list) else ():
+        if not isinstance(row, dict):
+            continue
+        name, url = row.get("name"), row.get("html_url")
+        if not isinstance(name, str) or not _REPO_NAME.fullmatch(f"{username}/{name}"):
+            continue
+        full_name = row.get("full_name")
+        if full_name is not None and (not isinstance(full_name, str) or full_name.casefold() != f"{username}/{name.casefold()}"):
+            continue
+        if not isinstance(url, str) or url.casefold() != f"https://github.com/{username}/{name.casefold()}":
+            continue
+        repo = {"name": name, "full_name": full_name, "html_url": url}
+        if isinstance(row.get("description"), str):
+            repo["description"] = redact(row["description"])
+        if _is_timestamp(row.get("pushed_at")):
+            repo["pushed_at"] = row["pushed_at"]
+        if type(row.get("open_issues_count")) is int:
+            repo["open_issues_count"] = row["open_issues_count"]
+        inventory[name.casefold()] = repo
+    return inventory
+
+
+def _saved_github_notes(run):
+    index = note_target(run.root, "Index.md")
+    folder = run.root / _previous_folders(run.root)[0]["projects"]
+    if folder.is_symlink() or not _is_managed_note(index):
+        return
+    links = _read(index).partition("\n## Projects\n\n")[2].split("\n\n", 1)[0]
+    for relative in re.findall(r"^- \[\[([^\n]+)\]\]$", links, re.MULTILINE):
+        path = run.root / f"{relative}.md"
+        if path.parent != folder or not _is_managed_note(path):
+            continue
+        text = _read(path)
+        full_name = _field(text, "repo")
+        if not full_name or not _REPO_NAME.fullmatch(full_name):
+            continue
+        owner, name = full_name.split("/")
+        if owner.casefold() != run.username.casefold():
+            continue
+        body = text.split("\n---\n", 1)[1].lstrip("\n").partition("\n\n")[2].rpartition("\n\n## Sessions\n\n")[0]
+        if body:
+            metadata = {"kind": "repo", "project": name, "repo": json.dumps(full_name)}
+            pushed = _field(text, "pushed-at")
+            if _is_timestamp(pushed):
+                metadata["pushed-at"] = pushed
+            yield name.casefold(), (relative + ".md", body + "\n\n", metadata)
 
 
 def _github_cache(path):
@@ -1157,24 +1503,43 @@ def _github_cache(path):
         saved = json.loads(_read(path)) if path.is_file() and not path.is_symlink() else {}
     except (OSError, UnicodeError, ValueError):
         return {}
-    repos = saved.get("repos") if isinstance(saved, dict) and saved.get("tag") == _CACHE_TAG else None
-    if not isinstance(repos, dict):
+    if not isinstance(saved, dict) or saved.get("version") != 1:
         return {}
-    return {name: entry for name, entry in repos.items() if isinstance(entry, dict)
-            and set(entry) == {"pushed-at", "docs", "issues", "etag"} and all(isinstance(value, str) for value in entry.values())}
+    repos, valid = saved.get("repos"), {}
+    for name, entry in (repos.items() if isinstance(repos, dict) else ()):
+        if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) for key in ("pushed-at", "docs", "issues", "etag")):
+            continue
+        if not _valid_pending_docs(entry.get("pending-docs")):
+            entry.pop("pending-docs", None)
+        valid[name] = entry
+    saved["repos"] = valid
+    return saved
+
+
+def _valid_pending_docs(pending):
+    if not isinstance(pending, dict) or not _is_timestamp(pending.get("revision")):
+        return False
+    names, sections = pending.get("names", []), pending.get("sections")
+    return (isinstance(names, list) and all(isinstance(name, str) and _GITHUB_DOC_NAME.fullmatch(name) for name in names)
+            and isinstance(sections, list) and len(sections) <= 1 + len(names)
+            and all(isinstance(section, str) for section in sections))
 
 
 def _github_repo_content(full_name, repo, token, entry):
     api = f"{_GITHUB_API}repos/{full_name}"
     pushed = repo["pushed_at"] if _is_timestamp(repo.get("pushed_at")) else ""
     if not pushed or entry["pushed-at"] != pushed:
-        sections = []
-        try:
-            _github_docs(api, token, sections)
-        except Exception:
-            entry["docs"] = entry["docs"] or "\n\n".join(sections)
-            raise
-        entry.update({"pushed-at": pushed, "docs": "\n\n".join(sections)})
+        pending = entry.get("pending-docs", {})
+        if pushed and pending.get("revision") == pushed:
+            pending = {**pending, "sections": pending["sections"].copy()}
+        else:
+            pending = {"revision": pushed, "sections": []}
+        entry["pending-docs"] = pending
+        _github_docs(api, token, pending)
+        entry.update({"pushed-at": pushed, "docs": _github_doc_text(pending["sections"])})
+        del entry["pending-docs"]
+    else:
+        entry.pop("pending-docs", None)
     if repo.get("open_issues_count") == 0:
         entry.update(issues=_NO_ISSUES, etag="")
         return
@@ -1201,22 +1566,27 @@ def _link_text(title):
 _NO_ISSUES = "## Open issues and pull requests\n\nNone open."
 
 
-def _github_docs(api, token, sections):
-    readme = _github_text(f"{api}/readme", token)
-    if readme:
-        sections.append(f"## README\n\n{readme}")
-    try:
-        listing = json.loads(_github_get(f"{api}/contents/docs", token)[0])
-    except HTTPError as error:
-        if error.code != 404:
-            raise
-        listing = []
-    names = sorted(entry["name"] for entry in listing if isinstance(entry, dict) and entry.get("type") == "file"
-                   and isinstance(entry.get("name"), str) and re.fullmatch(r"[^/\\]+\.md", entry["name"], re.IGNORECASE)) if isinstance(listing, list) else []
-    for name in names:
+def _github_doc_text(sections):
+    return "\n\n".join(filter(None, sections))
+
+
+def _github_docs(api, token, pending):
+    sections = pending["sections"]
+    if not sections:
+        readme = _github_text(f"{api}/readme", token)
+        sections.append(f"## README\n\n{readme}" if readme else "")
+    if "names" not in pending:
+        try:
+            listing = json.loads(_github_get(f"{api}/contents/docs", token)[0])
+        except HTTPError as error:
+            if error.code != 404:
+                raise
+            listing = []
+        pending["names"] = sorted(entry["name"] for entry in listing if isinstance(entry, dict) and entry.get("type") == "file"
+                                  and isinstance(entry.get("name"), str) and _GITHUB_DOC_NAME.fullmatch(entry["name"])) if isinstance(listing, list) else []
+    for name in pending["names"][len(sections) - 1:]:
         text = _github_text(f"{api}/contents/docs/{quote(name)}", token)
-        if text:
-            sections.append(f"## docs/{name}\n\n{text}")
+        sections.append(f"## docs/{name}\n\n{text}" if text else "")
 
 
 def _github_text(url, token):
@@ -1302,6 +1672,16 @@ def chat_export_source(run):
     exports = [("chatgpt", export) for export in run.chatgpt_exports] + [("claude-ai", export) for export in run.claude_exports]
     if not exports:
         return None
+    try:
+        return _chat_export_notes(run, exports)
+    except SourceError as error:
+        saved, _, history = _folder_state(run.root)
+        sessions, _ = _resolve_sessions(run.root, run.folders["sessions"], [*history, saved["sessions"]], [])
+        notes = [(note, text, meta) for _, _, meta, note, text in sessions if meta["source"] in _CHAT_EXPORTS]
+        raise SourceError(str(error), notes=notes) from None
+
+
+def _chat_export_notes(run, exports):
     sessions = {}
     for source, export in exports:
         export = Path(export).expanduser().resolve()
@@ -1336,7 +1716,8 @@ SOURCES = [
 ]
 
 
-def build_from_files(files, output, username, notes=(), notion_exports=(), folders=(), chatgpt_exports=(), claude_exports=()):
+def build_from_files(files, output, username, notes=(), notion_exports=(), folders=(), chatgpt_exports=(), claude_exports=(),
+                     *, transcript_folders=()):
     root = Path(output).expanduser().resolve()
     folders = {**FOLDERS, **dict(folders)}
     fresh = _unbuilt(root)
@@ -1344,7 +1725,7 @@ def build_from_files(files, output, username, notes=(), notion_exports=(), folde
     if fresh:
         _apply_template(root, folders)
     run = SimpleNamespace(root=root, files=files, username=username, notes=notes, notion_exports=notion_exports, folders=folders,
-                          chatgpt_exports=chatgpt_exports, claude_exports=claude_exports)
+                          chatgpt_exports=chatgpt_exports, claude_exports=claude_exports, transcript_folders=transcript_folders)
     items, sources = [], {}
     for name, source in SOURCES:
         try:
@@ -1352,34 +1733,49 @@ def build_from_files(files, output, username, notes=(), notion_exports=(), folde
             found = None if found is None else list(found)
         except SourceError as error:
             sources[name] = {"state": "failed", "reason": str(error)}
+            items += error.notes
             continue
         if found is None:
             sources[name] = {"state": "skipped"}
             continue
         sources[name] = {"state": "ok", "count": len(found)}
         items += found
-    _rename_folders(root, folders, all(source["state"] != "failed" for source in sources.values()))
-    projects, sessions = _write_vault(root, items, folders)
+    failed = {name for name, result in sources.items() if result["state"] == "failed"}
+    history = _rename_folders(root, folders, not failed)
+    update_daily = failed.isdisjoint(("transcripts", "notes", "notion", "chat-exports"))
+    projects, sessions = _write_vault(root, items, folders, history, update_daily)
     imported = sum(1 for _, _, metadata in items if metadata.get("kind", "note") == "note")
     print(f"Built vault at {root} ({projects} projects, {sessions} sessions, {imported} imported notes)")
     return sources
 
 
 def _previous_folders(root):
+    folders, pending, _ = _folder_state(root)
+    return folders, pending
+
+
+def _folder_state(root):
     state = root / ".coldvault" / "folders.json"
     try:
         saved = json.loads(_read(state)) if not state.is_symlink() else None
     except (OSError, UnicodeError, ValueError):
         saved = None
     if not isinstance(saved, dict):
-        return FOLDERS, None
+        return FOLDERS, None, []
     pending = saved.pop("pending", None)
+    history = saved.pop("session-folders", [])
+    if not isinstance(history, list) or not all(map(_folder_name, history)):
+        history = []
     complete = _valid_folders(pending) and set(pending) == set(FOLDERS)
-    return (saved if _valid_folders(saved) and set(saved) == set(FOLDERS) else FOLDERS), (pending if complete else None)
+    return (saved if _valid_folders(saved) and set(saved) == set(FOLDERS) else FOLDERS), (pending if complete else None), history
 
 
-def _save_folders(root, folders, pending=None):
-    state = {**folders, "pending": pending} if pending else folders
+def _save_folders(root, folders, history, pending=None):
+    state = dict(folders)
+    if pending:
+        state["pending"] = pending
+    if history:
+        state["session-folders"] = history
     _atomic_write(_owned_folder(root, (".coldvault",)) / "folders.json", json.dumps(state, indent=2) + "\n")
 
 
@@ -1388,7 +1784,7 @@ def _crossed_folder(previous, folders):
                  if other != key and name.casefold() == old.casefold()), None)
 
 
-def _relink(path, renames):
+def _relink(path, renames, retained):
     if not _is_managed_note(path):
         return
     lines = _read(path).split("\n")
@@ -1398,8 +1794,11 @@ def _relink(path, renames):
     before = "\n".join(lines)
 
     def target(match):
-        head, slash, rest = match.group(0).partition("/")
-        return match.group(0) if match.group(1) or match.group(2) or not slash or head not in renames else f"{renames[head]}/{rest}"
+        original = match.group(0)
+        head, slash, rest = original.partition("/")
+        if match.group(1) or match.group(2) or not slash or head not in renames or original in retained:
+            return original
+        return f"{renames[head]}/{rest}"
 
     after = _CODE_OR_WIKILINK.sub(target, before)
     if after != before:
@@ -1409,14 +1808,28 @@ def _relink(path, renames):
 
 
 def _rename_folders(root, folders, ready=True):
-    saved, pending = _previous_folders(root)
+    saved, pending, history = _folder_state(root)
     if saved == folders or _crossed_folder(saved, folders) or (pending and pending != folders):
-        return
-    _save_folders(root, saved, folders)
+        return history
+    if saved["sessions"] != folders["sessions"] and saved["sessions"] not in history:
+        history.append(saved["sessions"])
+    _save_folders(root, saved, history, folders)
     if not ready:
-        return
+        return history
     base = root.resolve()
     moves = []
+    retained = set()
+    for name in history:
+        folder = root / name
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        paths = sorted(folder.glob("*.md"))
+        frozen = set()
+        for path in paths:
+            text, fields = _session_text(path)
+            if _session_identity(fields) and set(text.split("\n", 3)[:3]) & _MARKERS.keys() and not _is_managed_note(path):
+                frozen.add(_session_family(path.name))
+        retained.update(f"{name}/{path.stem}" for path in paths if _session_family(path.name) in frozen)
     for key, old in saved.items():
         source = root / old
         if old == folders[key] or source.is_symlink() or not source.is_dir():
@@ -1424,7 +1837,7 @@ def _rename_folders(root, folders, ready=True):
         moves += [(source, path, root / folders[key] / path.relative_to(source)) for path in sorted(source.rglob("*.md"))]
     emptied, stranded = set(), False
     for source, path, target in moves:
-        if not _is_managed_note(path) or not _inside(base, path.resolve()):
+        if path.relative_to(root).as_posix().removesuffix(".md") in retained or not _is_managed_note(path) or not _inside(base, path.resolve()):
             continue
         if not _inside(base, target.parent.resolve()):
             stranded = True
@@ -1444,16 +1857,17 @@ def _rename_folders(root, folders, ready=True):
         with contextlib.suppress(OSError):
             folder.rmdir()
     renames = {saved[key]: folders[key] for key in folders if saved[key] != folders[key]}
-    for name in folders.values():
+    for name in dict.fromkeys([*folders.values(), *history]):
         folder = root / name
         if not folder.is_symlink() and folder.is_dir():
             for path in sorted(folder.rglob("*.md")):
                 if _inside(base, path.resolve()):
-                    _relink(path, renames)
+                    _relink(path, renames, retained)
     home = root / "Home.md"
     if not home.is_symlink() and _current_text(home) == _home(saved):
         _atomic_write(home, _home(folders))
-    _save_folders(root, saved if stranded else folders, folders if stranded else None)
+    _save_folders(root, saved if stranded else folders, history, folders if stranded else None)
+    return history
 
 
 _CACHE_TAG = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -1474,7 +1888,9 @@ def _transcript_cache(path):
                 if not isinstance(info, list):
                     return {}
                 (key, name), day, text, source, session = info
-                if not all(isinstance(value, str) for value in (key, name, day, text, source, session)):
+                if not all(isinstance(value, str) for value in (key, name, day, text, source)):
+                    return {}
+                if session is not None and not isinstance(session, str):
                     return {}
         return files
     except (OSError, UnicodeError, ValueError, KeyError, TypeError):
@@ -1505,6 +1921,11 @@ def _planned(root, relative):
 
 
 _KEPT_SESSION = re.compile(r"# [^\n]*\n\nProject: [^\n]*\n\n(.*)", re.DOTALL)
+_CONTINUATION = re.compile(r" \(continued(?: (\d+))?\)\.md$")
+
+
+def _session_family(filename):
+    return _CONTINUATION.sub(".md", filename)
 
 
 def _frontmatter_values(text):
@@ -1518,46 +1939,135 @@ def _frontmatter_values(text):
     return values
 
 
-def _kept_sessions(root, folder, sessions):
-    base = root / folder
-    if base.is_symlink() or not base.is_dir():
-        return []
-    taken = {path for *_, meta, note, _ in sessions for path in (note, *meta["legacy"])}
-    keys = {name: key for key, name, *_ in sessions}
-    kept = []
-    for path in sorted(base.glob("*.md")):
-        note = path.relative_to(root).as_posix()
-        if note in taken or path.name.endswith(" (continued).md") or _OLD_COPY.search(path.name) or path.is_symlink() or not path.is_file():
-            continue
-        try:
+def _session_identity(fields):
+    source, session_id = fields.get("source"), fields.get("session-id")
+    if isinstance(source, str) and isinstance(session_id, str):
+        return source, session_id
+    return None
+
+
+def _same_transcript(first, second):
+    return bool(first and second and (first.startswith(second) or second.startswith(first)))
+
+
+def _different_session(fields, meta):
+    identity = _session_identity(fields)
+    return identity is not None and (
+        identity != _session_identity(meta)
+        or ("session-id-fallback" in fields and fields["session-id-fallback"] != meta.get("session-id-fallback"))
+    )
+
+
+def _session_text(path):
+    if not path.is_symlink() and path.is_file():
+        with contextlib.suppress(OSError, UnicodeError):
             text = _read(path)
-        except (OSError, UnicodeError):
+            if _has_frontmatter(text):
+                return text, _frontmatter_values(text)
+    return "", {}
+
+
+def _resolve_sessions(root, folder, history, sessions):
+    continuation_candidates = {}
+    stored, by_identity = {}, {}
+    history = [name for name in dict.fromkeys(history) if name != folder]
+    for name in [folder, *history]:
+        base = root / name
+        if base.is_symlink() or not base.is_dir():
             continue
-        if not _has_frontmatter(text):
+        for path in sorted(base.glob("*.md")):
+            part = _CONTINUATION.search(path.name)
+            if part:
+                note = f"{name}/{_session_family(path.name)}"
+                continuation_candidates.setdefault(note, []).append((int(part[1] or 1), path))
+                continue
+            if _OLD_COPY.search(path.name):
+                continue
+            text, fields = _session_text(path)
+            identity = _session_identity(fields)
+            if not identity or (name != folder and not set(text.split("\n", 3)[:3]) & _MARKERS.keys()):
+                continue
+            note = path.relative_to(root).as_posix()
+            match = _KEPT_SESSION.fullmatch(text[text.index("\n---\n", 3) + 6:].lstrip("\n"))
+            stored[note] = (fields, match.group(1).rstrip() if match else "")
+            if fields.get("session-id-fallback") != "true":
+                by_identity.setdefault(identity, []).append(note)
+
+    live_counts = Counter(_session_identity(meta) for *_, meta, _, _ in sessions)
+    resolved, taken = [], set()
+    for key, name, meta, note, text in sessions:
+        identity = _session_identity(meta)
+        explicit_id = meta.get("session-id-fallback") == "false"
+        prior = [f"{name}/{Path(note).name}" for name in history]
+        matches = by_identity.get(identity, ()) if explicit_id else [candidate for candidate in prior if candidate in stored]
+        ambiguous = live_counts[identity] > 1 or len(matches) > 1
+        preferred = note
+        previous_paths = set(meta.get("previous-paths", ())) | set(meta["legacy"])
+
+        def matches_note(candidate):
+            fields, body = stored[candidate]
+            if _different_session(fields, meta):
+                return False
+            if _same_transcript(body, text):
+                return True
+            if ambiguous:
+                return False
+            if not explicit_id and ("session-id-fallback" in fields or "session-id-fallback" not in meta):
+                return True
+            associated = candidate == preferred or candidate in prior or (explicit_id and candidate in previous_paths)
+            return associated and _frozen(root, candidate)
+
+        if note not in stored or not matches_note(note):
+            note = next((candidate for candidate in matches if candidate not in taken and matches_note(candidate)), note)
+        stem, number = note.removesuffix(".md"), 2
+        while note in taken or (note in stored and not matches_note(note)):
+            note = f"{stem} ({number}).md"
+            number += 1
+        legacy = [path for path in meta["legacy"]
+                  if path not in stored or (not _different_session(stored[path][0], meta) and _same_transcript(stored[path][1], text))]
+        resolved.append((key, name, {**meta, "legacy": legacy}, note, text))
+        taken.add(note)
+    taken.update(path for *_, meta, _, _ in resolved for path in meta["legacy"] if _is_managed_note(root / path))
+
+    keys = {name: key for key, name, *_ in sessions}
+    for note, (values, body) in stored.items():
+        if note in taken:
             continue
-        values = _frontmatter_values(text)
-        body = _KEPT_SESSION.fullmatch(text[text.index("\n---\n", 3) + 6:].lstrip("\n"))
         fields = [values.get(name) for name in ("project", "date", "source", "session-id")]
         if not body or not all(isinstance(value, str) for value in fields):
             continue
         name, date, source, session_id = fields
         recorded = values.get("project-key")
         key = recorded if isinstance(recorded, str) else keys.get(name, name)
-        kept.append((key, name, {"kind": "session", "project": (key, name), "date": date, "source": source,
-                                 "session-id": session_id, "legacy": [], "kept": True,
-                                 "keyed": isinstance(recorded, str) or name in keys}, note, body.group(1).rstrip()))
-    return kept
+        resolved.append((key, name, {"kind": "session", "project": (key, name), "date": date, "source": source,
+                                     "session-id": session_id, "legacy": [], "kept": True,
+                                     "keyed": isinstance(recorded, str) or name in keys,
+                                     **({"session-id-fallback": values["session-id-fallback"]} if "session-id-fallback" in values else {})},
+                         note, body))
+    return resolved, continuation_candidates
 
 
-def _write_vault(root, items, folders):
+def _session_continuations(root, note, meta, candidates):
+    parts = {}
+    next_number = 1
+    for number, path in sorted(candidates):
+        next_number = number + 1
+        _, fields = _session_text(path)
+        if _session_identity(fields) is not None and not _different_session(fields, meta):
+            parts[path.relative_to(root).as_posix()] = fields.get("paragraphs-before", "")
+    suffix = "" if next_number == 1 else f" {next_number}"
+    return parts, f"{note.removesuffix('.md')} (continued{suffix}).md"
+
+
+def _write_vault(root, items, folders, history, update_daily):
     sessions = [(*meta["project"], meta, note, text) for note, text, meta in items if meta.get("kind") == "session"]
-    sessions += _kept_sessions(root, folders["sessions"], sessions)
+    sessions, continuation_candidates = _resolve_sessions(root, folders["sessions"], history, sessions)
     repos = {}
     for _, text, meta in items:
         if meta.get("kind") == "repo":
             repos.setdefault(meta["project"], (text, meta))
-    imported = [(note, text) for note, text, meta in items if meta.get("kind", "note") == "note"]
-    notion = {note for note, _, meta in items if meta.get("kind", "note") == "note" and meta.get("source") == "notion"}
+    imported = [(note, text, meta) for note, text, meta in items if meta.get("kind", "note") == "note"]
+    notion = {note for note, _, meta in imported if meta.get("source") == "notion"}
     projects = {project: name for project, name, *_ in sessions}
     for name in repos:
         if name not in projects.values():
@@ -1566,36 +2076,56 @@ def _write_vault(root, items, folders):
     project_paths = {key: _planned(root, f"{folders['projects']}/{unique}.md") for key, unique in project_slugs((key, projects[key]) for key in keys).items()}
     now = _utc_now()
     session_notes = {}
+    continuations = {}
     for project, _, meta, note, text in sessions:
         target, title, header = note, f"{projects[project]} — {meta['date']}", f"Project: {link(project_paths[project])}"
-        if meta.get("kept") and _frozen(root, note):
+        parts, next_part = _session_continuations(root, note, meta, continuation_candidates.get(note, ()))
+        continuations[note] = list(parts)
+        frozen = _frozen(root, note)
+        if meta.get("kept") and (frozen or parts):
             continue
-        if _frozen(root, note):
-            text = _new_messages(root, note, text)
+        if frozen or parts:
+            paragraphs = text.split("\n\n")
+            prefix = [note, *parts]
+            target = next_part
+            if parts and _is_managed_note(root / prefix[-1]):
+                target = prefix.pop()
+            for part in [*prefix, target]:
+                before = parts.get(part, "")
+                if re.fullmatch(r"[0-9]{1,9}", before):
+                    text = "\n\n".join(paragraphs[int(before):])
+                if part != target:
+                    text = _new_messages(root, part, text)
             if not text:
                 continue
-            target, title, header = f"{note.removesuffix('.md')} (continued).md", f"{title} (continued)", f"{header}\n\nContinues {link(note)}"
+            paragraphs_before = len(paragraphs) - len(text.split("\n\n"))
+            title = f"{title} (continued)"
+            header = f"{header}\n\nContinues {link(prefix[-1])}"
         session_notes[target] = (note, _render(_frontmatter({
             "source": meta["source"],
             "date": meta["date"] if _is_day(meta["date"]) else json.dumps(meta["date"]),
             "project": json.dumps(projects[project]),
             **({"project-key": json.dumps(project)} if meta.get("keyed", True) else {}),
             "session-id": json.dumps(meta["session-id"]),
+            **({"session-id-fallback": meta["session-id-fallback"]} if "session-id-fallback" in meta else {}),
             "imported-at": _imported_at(root / _planned(root, target), now),
+            **({"paragraphs-before": paragraphs_before} if target != note else {}),
             "paragraphs": len(text.split("\n\n")),
         }) + f"# {title}\n\n{header}\n\n{text}"))
     current = {target for target, (_, rendered) in session_notes.items() if _unchanged(root, target, rendered)}
     session_files = {target: target if target in current else _planned(root, target) for target in session_notes}
     session_paths = {note: note for *_, note, _ in sessions}
-    continuations = {note: f"{note.removesuffix('.md')} (continued).md" for *_, meta, note, _ in sessions
-                     if meta.get("kept") and _is_managed_note(root / f"{note.removesuffix('.md')} (continued).md")}
     for target, (note, _) in session_notes.items():
         if target == note:
             session_paths[note] = session_files[target]
-        else:
-            continuations[note] = session_files[target]
+        elif target not in continuations[note]:
+            continuations[note].append(session_files[target])
     imported_paths, reserved = {}, set()
-    for note, _ in imported:
+    for note, _, meta in imported:
+        if meta.get("kept"):
+            imported_paths[note] = note
+            reserved.add(note.casefold())
+            continue
         planned, number = _planned(root, note), 2
         while planned.casefold() in reserved:
             planned, number = _planned(root, f"{note.removesuffix('.md')} ({number}).md"), number + 1
@@ -1612,16 +2142,18 @@ def _write_vault(root, items, folders):
         if name in repos:
             text, meta = repos[name]
             body = _frontmatter({field: meta[field] for field in ("repo", "pushed-at") if field in meta}) + body + text
-        links = [f"- {link(session_paths[note])} ({meta['date']})" + (f" · {link(continuations[note])}" if note in continuations else "")
+        links = [f"- {link(session_paths[note])} ({meta['date']})" + "".join(f" · {link(part)}" for part in continuations[note])
                  for project, _, meta, note, _ in sessions if project == key]
         body += "## Sessions\n\n" + ("\n".join(links) if links else "No local sessions found.")
         write_note(root, project_paths[key], body)
     moved = {note.removesuffix(".md"): path.removesuffix(".md") for note, path in imported_paths.items() if note != path and note in notion}
-    days, written = {}, set()
+    days = {}
     for project, _, meta, note, _ in sessions:
-        if _is_day(meta["date"]) and not meta.get("kept"):
+        if _is_day(meta["date"]):
             days.setdefault(meta["date"], ([], []))[0].append(f"- {link(session_paths[note])} · {link(project_paths[project])}")
-    for note, text in imported:
+    for note, text, meta in imported:
+        if meta.get("kept"):
+            continue
         if moved and note in notion:
             text = _CODE_OR_WIKILINK.sub(lambda match: match.group(0) if match.group(1) or match.group(2) else moved.get(match.group(0), match.group(0)), text)
         stamp = _field(text, "imported-at")
@@ -1636,20 +2168,22 @@ def _write_vault(root, items, folders):
         if _is_timestamp(stamp):
             days.setdefault(stamp[:10], ([], []))[1].append(f"- {link(imported_paths[note])}")
         write_note(root, imported_paths[note], text)
-    for day, (day_sessions, day_imported) in sorted(days.items()):
-        body = _frontmatter({"record_type": "daily_index", "date": day}) + f"# {day}\n"
-        if day_sessions:
-            body += "\n## Sessions\n\n" + "\n".join(day_sessions) + "\n"
-        if day_imported:
-            body += "\n## Imported notes\n\n" + "\n".join(day_imported) + "\n"
-        written.add(write_note(root, _planned(root, f"Daily/{day}.md"), body))
-    daily = root / "Daily"
-    for path in [] if daily.is_symlink() or not daily.is_dir() else sorted(daily.glob("*.md")):
-        if path.relative_to(root).as_posix() not in written and _DAILY_NOTE.fullmatch(path.name) and _is_managed_note(path) and _field(_read(path), "record_type") == "daily_index":
-            path.unlink()
+    if update_daily:
+        written = set()
+        for day, (day_sessions, day_imported) in sorted(days.items()):
+            body = _frontmatter({"record_type": "daily_index", "date": day}) + f"# {day}\n"
+            if day_sessions:
+                body += "\n## Sessions\n\n" + "\n".join(day_sessions) + "\n"
+            if day_imported:
+                body += "\n## Imported notes\n\n" + "\n".join(day_imported) + "\n"
+            written.add(write_note(root, _planned(root, f"Daily/{day}.md"), body))
+        daily = root / "Daily"
+        for path in [] if daily.is_symlink() or not daily.is_dir() else sorted(daily.glob("*.md")):
+            if path.relative_to(root).as_posix() not in written and _DAILY_NOTE.fullmatch(path.name) and _is_managed_note(path) and _field(_read(path), "record_type") == "daily_index":
+                path.unlink()
     index = "# Vault index\n\n## Projects\n\n" + "\n".join(f"- {link(project_paths[key])}" for key in keys)
     if imported:
-        index += "\n\n## Imported notes\n\n" + "\n".join(f"- {link(imported_paths[note])}" for note, _ in imported)
+        index += "\n\n## Imported notes\n\n" + "\n".join(f"- {link(imported_paths[note])}" for note, _, _ in imported)
     write_note(root, index_path, index)
     write_note(root, start_path, (
         f"# Start here\n\nOpen {link(index_path)} to browse projects and sessions.\n\n"
@@ -1658,7 +2192,9 @@ def _write_vault(root, items, folders):
         "Search the vault from a terminal:\n\n"
         "    python3 coldvault.py search TERM --vault DIR\n"
     ))
-    _retire_path_keyed_sessions(root, [session for session in sessions if not session[2].get("kept")], set(session_files.values()))
+    _retire_path_keyed_sessions(root, [session for session in sessions if not session[2].get("kept")],
+                                set(session_files.values()) | session_paths.keys()
+                                | {part for parts in continuations.values() for part in parts})
     return len(keys), len(sessions)
 
 
@@ -1695,7 +2231,9 @@ def _retire_path_keyed_sessions(root, sessions, written):
         continued = [] if _frozen(root, note) else [f"{note.removesuffix('.md')} (continued).md"]
         for old in [*meta["legacy"], *continued, *copies]:
             if old not in written and _is_managed_note(root / old):
-                (root / old).unlink()
+                _, fields = _session_text(root / old)
+                if not _different_session(fields, meta):
+                    (root / old).unlink()
 
 
 def _read(path):

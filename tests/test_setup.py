@@ -39,13 +39,14 @@ class SetupTests(unittest.TestCase):
             home = Path(temporary)
             transcripts, notes = self.make_home(home)
             vault, flagged = home / "vault", home / "flagged"
-            answers = f"{vault}\n\n\n{notes}\n\n\n\n"
+            answers = f"{vault}\n\n\n{notes}\n\n\n\n\n\n"
 
             setup = self.kit(home, "setup", answers=answers)
             self.assertEqual(0, setup.returncode, setup.stderr)
             self.assertIn(f"{transcripts}: 1 sessions", setup.stdout)
             config = json.loads((vault / ".coldvault" / "config.json").read_text(encoding="utf-8"))
-            self.assertEqual({"version": 1, "transcripts": [str(transcripts)], "notes": [str(notes.resolve())], "notion_exports": [], "username": ""}, config)
+            self.assertEqual({"version": 1, "transcripts": [str(transcripts)], "notes": [str(notes.resolve())],
+                              "notion_exports": [], "chatgpt_exports": [], "claude_exports": [], "username": ""}, config)
 
             sync = self.kit(home, "sync", "--vault", str(vault))
             self.assertEqual(0, sync.returncode, sync.stderr)
@@ -79,7 +80,7 @@ class SetupTests(unittest.TestCase):
                 home = Path(temporary)
                 self.make_home(home)
                 with patch.multiple(coldvault, **missing):
-                    out, err = self.run_setup(home, [str(home / "vault"), "", "", "", "", ""])
+                    out, err = self.run_setup(home, [str(home / "vault"), "", "", "", "", "", "", ""])
                 warnings = [line for line in (out + err).splitlines() if "FTS5" in line]
                 self.assertEqual(["warning: SQLite FTS5 is not available; search will scan every note instead of using an index"], warnings)
                 self.assertNotIn("Traceback", out + err)
@@ -90,7 +91,7 @@ class SetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             home = Path(temporary)
             self.make_home(home)
-            result = self.kit(home, "setup", answers=f"{home / 'vault'}\n\n\n{home / 'missing'}\n\n\n\n")
+            result = self.kit(home, "setup", answers=f"{home / 'vault'}\n\n\n{home / 'missing'}\n\n\n\n\n\n")
             self.assertEqual(2, result.returncode)
             self.assertIn("notes folder not found", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
@@ -171,8 +172,19 @@ class SetupTests(unittest.TestCase):
             sessions = sorted((vault / "Sessions").iterdir())
             edited = next(s for s in sessions if "demo" in s.name)
             unedited = next(s for s in sessions if "other" in s.name)
-            edited.write_text(edited.read_text(encoding="utf-8") + "\nMy own line.\n", encoding="utf-8")
+            edited.write_bytes(edited.read_bytes().replace(b"Transcript text", b"My own line."))
             edited_bytes = edited.read_bytes()
+            transcript = transcripts / "session.jsonl"
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write("\n" + json.dumps({"type": "user", "cwd": "/work/demo",
+                                                "message": {"role": "user", "content": "First follow-up"}}))
+            self.assertEqual(0, self.kit(home, "sync", "--vault", str(vault)).returncode)
+            continued = edited.with_name(f"{edited.stem} (continued).md")
+            continued.write_bytes(continued.read_bytes().replace(b"First follow-up", b"My follow-up."))
+            continued_bytes = continued.read_bytes()
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write("\n" + json.dumps({"type": "user", "cwd": "/work/demo",
+                                                "message": {"role": "user", "content": "Next follow-up"}}))
             (vault / "Projects" / "mine.md").write_text("My own note\n", encoding="utf-8")
             moved_session = unedited.read_text(encoding="utf-8")
 
@@ -184,7 +196,11 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(edited_bytes, edited.read_bytes())
             self.assertEqual("My own note\n", (vault / "Projects" / "mine.md").read_text(encoding="utf-8"))
             self.assertEqual(["mine.md"], sorted(path.name for path in (vault / "Projects").iterdir()))
-            self.assertEqual([edited.name], sorted(path.name for path in (vault / "Sessions").iterdir()))
+            latest = edited.with_name(f"{edited.stem} (continued 2).md")
+            self.assertEqual({edited, continued, latest}, set((vault / "Sessions").glob("*.md")))
+            self.assertEqual(continued_bytes, continued.read_bytes())
+            self.assertTrue(latest.read_text(encoding="utf-8").endswith(
+                f"Continues [[Sessions/{continued.stem}]]\n\nNext follow-up\n"))
             self.assertFalse((vault / "Imported").exists())
             self.assertTrue(coldvault._is_managed_note(vault / "Library" / "My Notes" / "Plan.md"))
             other = vault / "Library" / "My Notes" / "Other.md"
@@ -193,11 +209,22 @@ class SetupTests(unittest.TestCase):
             new_session = vault / "Conversations" / unedited.name
             self.assertIn("imported-at: " + moved_session.split("imported-at: ")[1].split("\n")[0], new_session.read_text(encoding="utf-8"))
             self.assertIn("Project: [[Work/other]]", new_session.read_text(encoding="utf-8"))
-            self.assertIn(f"[[Conversations/{edited.stem}]]", (vault / "Work" / "demo.md").read_text(encoding="utf-8"))
+            self.assertEqual({new_session}, set((vault / "Conversations").glob("*.md")))
+            project = vault / "Work" / "demo.md"
+            links = project.read_bytes()
+            self.assertIn(f"[[Sessions/{edited.stem}]]".encode(), links)
+            self.assertIn(f"· [[Sessions/{continued.stem}]] · [[Sessions/{latest.stem}]]".encode(), links)
+            histories = {path: path.read_bytes() for path in (edited, continued, latest, new_session)}
+            for _ in range(2):
+                again = self.kit(home, "sync", "--vault", str(vault))
+                self.assertEqual(0, again.returncode, again.stderr)
+                paths = {*((vault / "Sessions").glob("*.md")), *((vault / "Conversations").glob("*.md"))}
+                self.assertEqual(histories, {path: path.read_bytes() for path in paths})
+                self.assertEqual(links, project.read_bytes())
             self.assertIn("- [[Work/other]]", (vault / "Index.md").read_text(encoding="utf-8"))
             self.assertIn("`Conversations/`", (vault / "Home.md").read_text(encoding="utf-8"))
 
-            again = self.kit(home, "setup", answers=f"{vault}\n\n\n\n\n\n")
+            again = self.kit(home, "setup", answers=f"{vault}\n\n\n\n\n\n\n\n")
             self.assertEqual(0, again.returncode, again.stderr)
             self.assertEqual(renamed, json.loads((vault / ".coldvault" / "config.json").read_text(encoding="utf-8"))["folders"])
             self.assertFalse((vault / "Projects" / "demo.md").exists())
@@ -284,7 +311,7 @@ class SetupTests(unittest.TestCase):
             transcripts, _ = self.make_home(home)
             vault = home / "vault"
             self.write_config(vault, transcripts, [], schedule_hours=6)
-            again = self.kit(home, "setup", answers=f"{vault}\n\n\n\n\n\n")
+            again = self.kit(home, "setup", answers=f"{vault}\n\n\n\n\n\n\n\n")
             self.assertEqual(0, again.returncode, again.stderr)
             self.assertEqual(6, json.loads((vault / ".coldvault" / "config.json").read_text(encoding="utf-8"))["schedule_hours"])
 

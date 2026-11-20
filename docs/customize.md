@@ -10,6 +10,8 @@ A complete example:
   "transcripts": ["~/.claude/projects", "~/.codex/sessions"],
   "notes": ["~/notes"],
   "notion_exports": ["~/Downloads/Export.zip"],
+  "chatgpt_exports": ["~/Downloads/chatgpt.zip"],
+  "claude_exports": ["~/Downloads/claude.zip"],
   "username": "your-github-name",
   "folders": {"projects": "Work", "sessions": "Conversations", "imported": "Library"},
   "schedule_hours": 1
@@ -23,6 +25,8 @@ A complete example:
 | `transcripts` | Claude Code and Codex sessions (`*.jsonl`) from each folder | `[]` |
 | `notes` | Every `.md` file in each folder, under `Imported/<folder name>/` | `[]` |
 | `notion_exports` | Notion **Export → Markdown & CSV** zips or unzipped folders, under `Imported/Notion/` | `[]` |
+| `chatgpt_exports` | ChatGPT data export ZIPs, under `Sessions/` | `[]` or omit |
+| `claude_exports` | Claude.ai data export ZIPs, under `Sessions/` | `[]` or omit |
 | `username` | Your public GitHub repositories, one project note each | `""` |
 
 Each list holds folder or file paths (`setup` saves them as absolute paths; `~` also works). `setup` asks for every one of them, so the easiest way to change sources is to run `setup` again; it keeps your `folders`. Notes and Notion folders must be outside the vault. To add a kind of source Coldvault doesn't know, see [add-a-source.md](add-a-source.md).
@@ -41,9 +45,16 @@ The starter folders created in a new vault (`Writing/`, `Context/`, `Capabilitie
 
 On Linux, `python3 ~/coldvault/coldvault.py schedule --vault ~/ColdvaultVault` adds one crontab line that rebuilds the vault every hour (or every `--hours N`, where N is 2, 3, 4, 6, 8, 12 or 24; runs start on the hour) and saves the interval as `schedule_hours`. Running it again replaces that line, and `schedule remove --vault ~/ColdvaultVault` deletes it. Windows is not supported for now.
 
+Use the same lock as Coldvault when you edit your Linux crontab by hand:
+
+    mkdir -p "$HOME/.cache"
+    flock "$HOME/.cache/coldvault-schedule.lock" crontab -e
+
+`crontab` replaces the whole table when it saves, so overlapping saves without the lock can overwrite each other. If a tool edits the table without this lock, finish that edit before installing, updating, or removing a Coldvault schedule.
+
 To schedule it by hand instead, the lines below rebuild `~/ColdvaultVault` every hour from the standard Claude and Codex folders, using the `~/coldvault/coldvault.py` from the README. Replace `''` with your GitHub username to include your public repositories.
 
-On Linux, add this line with `crontab -e`:
+On Linux, add this line with the locked crontab editor above:
 
     0 * * * * python3 "$HOME/coldvault/coldvault.py" --username '' --output "$HOME/ColdvaultVault"
 
@@ -80,4 +91,6 @@ To reuse the sources saved by `setup`, use `sync --vault FOLDER` in the line ins
 
 That runs every 6 hours. On a Mac, set `StartInterval` in the launchd file to the interval in seconds (`21600` for 6 hours).
 
-When you schedule by hand, add `"schedule_hours"` to `config.json`: the interval in whole hours (`6` here). `python3 coldvault.py status --vault FOLDER` then reports `stale` and exits 1 when no run has succeeded for twice that interval, so a broken schedule shows up. `setup` doesn't keep `schedule_hours`; add it back after running `setup` again.
+When you schedule by hand, set `schedule_hours` in `config.json` to the interval in whole hours (`6` here). Rerunning `setup` preserves this value. `python3 coldvault.py status --vault FOLDER` uses it as the expected interval. If the last successful run was more than twice that interval ago, `status` reports `stale` and exits 1.
+
+To change when a manually scheduled job runs, use the locked crontab editor above on Linux or update the launchd plist on macOS.

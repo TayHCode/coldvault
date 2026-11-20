@@ -22,7 +22,7 @@ Run the guided setup:
 
     python3 coldvault.py setup
 
-It checks your Python version and whether SQLite full-text search is available, and shows how many sessions it found in `~/.claude/projects`, `~/.codex/sessions` and `~/.codex/archived_sessions`. Then it asks for the vault folder (new or existing; your files are kept), which transcript and Markdown folders to import, and an optional GitHub username for your public repositories. It saves the answers, and no secrets, in `<vault>/.coldvault/config.json` and builds the vault. Run `setup` again to change them.
+It checks your Python version and whether SQLite full-text search is available, and shows how many sessions it found in `~/.claude/projects`, `~/.codex/sessions` and `~/.codex/archived_sessions`. Then it asks for the vault folder (new or existing; your files are kept), which transcript and Markdown folders to import, optional ChatGPT and Claude.ai export ZIPs, and an optional GitHub username for your public repositories. It saves the answers, and no secrets, in `<vault>/.coldvault/config.json` and builds the vault. Run `setup` again to change them.
 
 Transcript imports keep the conversation text, skip tool output, and replace common credential formats (API keys, tokens, private keys, passwords) with `[REDACTED]`.
 
@@ -50,13 +50,15 @@ Rebuild the vault every hour (or every `--hours N`, where N is 2, 3, 4, 6, 8, 12
 
 This adds one line to your crontab on Linux and leaves your other lines alone. `schedule remove --vault ~/ColdvaultVault` deletes it. On a Mac, use the steps in [Customize your vault](docs/customize.md#schedule), with `sync --vault` and your vault folder in the scheduled line so it reuses your saved setup.
 
+If you edit your Linux crontab by hand, use the [shared lock](docs/customize.md#schedule) to prevent overlapping saves.
+
 Claude Code deletes transcripts after `cleanupPeriodDays` days (30 by default). Notes already in the vault stay, but a deleted transcript can't be imported again. Raise the limit in `~/.claude/settings.json`, for example `"cleanupPeriodDays": 365`.
 
 ## Check that it is working
 
     python3 ~/coldvault/coldvault.py status --vault ~/ColdvaultVault
 
-It prints each source as `ok`, `failed (reason)` or `skipped`, the time of the last fully successful run, and when the next scheduled run is due. It exits 0 when the last run succeeded, and 1 when it failed or no run has succeeded for twice the schedule interval.
+It prints each source as `ok`, `failed (reason)` or `skipped`, the time of the last fully successful run, and when the next scheduled run is due. The due time can be `unknown`, for example with a `CRON_TZ` override or a daily schedule near a daylight saving change. It exits 0 when the last run succeeded, and 1 when it failed or no run has succeeded for twice the schedule interval.
 
 To search the vault from a terminal, run `python3 coldvault.py search TERM --vault ~/ColdvaultVault` (add `--json` for JSON).
 
@@ -72,7 +74,7 @@ First stop the schedule, while the vault still has its saved setup. If you set i
 
     python3 ~/coldvault/coldvault.py schedule remove --vault ~/ColdvaultVault
 
-If you added the line by hand, run `crontab -e` and delete the line that runs `coldvault.py` (or the older `vault_kit.py`). On a Mac, unload the launchd agent and delete it:
+If you added the line by hand, use the [shared lock](docs/customize.md#schedule) to open `crontab -e` and delete the line that runs `coldvault.py` (or the older `vault_kit.py`). On a Mac, unload the launchd agent and delete it:
 
     launchctl bootout gui/$(id -u)/coldvault.rebuild
     rm ~/Library/LaunchAgents/coldvault.rebuild.plist
@@ -114,6 +116,8 @@ Deleting the whole `.coldvault/` folder also rebuilds the index, but it forgets 
 `.coldvault/` moves with the vault, so the answers saved by `setup` still apply, and the search index rebuilds itself on the next search. If you never ran `setup`, run your usual command with the new `--output` instead and change `--output` in your cron line. On a Mac, change it in the plist and reload it as described in [Customize your vault](docs/customize.md#schedule). Open the new folder in Obsidian with **Open folder as vault**.
 
 **Restoring from the sync target.** See [Restore from the sync target](docs/sync.md#restore-from-the-sync-target).
+
+**Restoring original transcripts.** Coldvault setup and sync leave originals at their source. To keep selected originals after the source expires, follow the [opt-in private backup and restore steps](docs/sync.md#back-up-and-restore-original-transcripts).
 
 ## Privacy
 

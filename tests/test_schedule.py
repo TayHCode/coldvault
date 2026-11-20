@@ -19,6 +19,7 @@ SCRATCH.mkdir(exist_ok=True)
 USER_LINES = "SHELL=/bin/sh\n# my backups\n30 2 * * * /usr/local/bin/backup --all\n"
 FAKE_CRONTAB = """#!/bin/sh
 if [ "$1" = "-l" ]; then
+  [ -z "${FAKE_CRONTAB_READ_FAIL:-}" ] || { echo "crontab: permission denied" >&2; exit 1; }
   [ -f "$FAKE_CRONTAB" ] || { echo "no crontab for $(id -un)" >&2; exit 1; }
   cat "$FAKE_CRONTAB"
 elif [ "$1" = "-" ]; then
@@ -188,6 +189,43 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(before < due <= before + timedelta(hours=6), out)
         self.assertEqual((0, 0, 0), (due.hour % 6, due.minute, due.second), out)
 
+    def test_status_reports_only_an_expected_interval_after_external_deletion(self):
+        self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault), "--hours", "6")[0])
+        self.crontab.unlink()
+        _, out, err = self.kit("status", "--vault", str(self.vault))
+        self.assertIn("schedule: installation unverified (expected every 6h)", out)
+        self.assertNotIn("next run due", out)
+        self.assertEqual("", err)
+
+    def test_status_reports_unknown_when_crontab_cannot_be_read(self):
+        self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault))[0])
+        self.env["FAKE_CRONTAB_READ_FAIL"] = "1"
+        code, out, err = self.kit("status", "--vault", str(self.vault))
+        self.assertEqual(1, code)
+        self.assertIn("schedule: unknown (expected every 1h)", out)
+        self.assertNotIn("next run due", out)
+        self.assertEqual("", err)
+
+    def test_status_detects_the_tagged_entry_with_a_different_saved_interval(self):
+        self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault), "--hours", "6")[0])
+        config = self.config()
+        config["schedule_hours"] = 1
+        (self.vault / ".coldvault" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        _, out, _ = self.kit("status", "--vault", str(self.vault))
+        self.assertIn("schedule: installed, next run due ", out)
+        self.assertIn("(every 6h)", out)
+
+    def test_saved_interval_and_disabled_entries_do_not_confirm_installation(self):
+        self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault))[0])
+        line = self.cron_lines()[0]
+        tag = line.rsplit("#", 1)[1]
+        for disabled in ("# " + line, f"0 * * * * #{tag}"):
+            with self.subTest(disabled=disabled):
+                self.crontab.write_text(USER_LINES + disabled + "\n", encoding="utf-8")
+                _, out, _ = self.kit("status", "--vault", str(self.vault))
+                self.assertIn("schedule: installation unverified (expected every 1h)", out)
+                self.assertNotIn("next run due", out)
+
 
     def test_next_run_follows_daylight_saving_and_half_hour_zones(self):
         cases = [
@@ -206,16 +244,16 @@ class ScheduleTests(unittest.TestCase):
     def test_a_crontab_edited_meanwhile_is_not_overwritten(self):
         self.crontab.write_text(USER_LINES, encoding="utf-8")
         reads = []
-        run = coldvault._run
+        run = subprocess.run
 
-        def edit_between_reads(parser, command, stdin="", missing_ok=None):
+        def edit_between_reads(command, **kwargs):
             if command[1:] == ["-l"]:
                 reads.append(command)
                 if len(reads) == 2:
                     self.crontab.write_text(USER_LINES + "45 * * * * /bin/true\n", encoding="utf-8")
-            return run(parser, command, stdin, missing_ok)
+            return run(command, **kwargs)
 
-        with patch.object(coldvault, "_run", edit_between_reads):
+        with patch.object(subprocess, "run", edit_between_reads):
             code, _, err = self.kit("schedule", "--vault", str(self.vault))
         self.assertEqual(2, code)
         self.assertIn("crontab changed", err)

@@ -49,7 +49,8 @@ class StatusTests(unittest.TestCase):
         return self.kit("sync", "--transcripts", str(self.transcripts), "--username", username, "--vault", str(self.vault), **options)
 
     def status(self):
-        return self.kit("status", "--vault", str(self.vault))
+        with patch.object(sys, "platform", "linux"), patch.object(coldvault, "_run", return_value=""):
+            return self.kit("status", "--vault", str(self.vault))
 
     def receipt(self):
         return json.loads((self.vault / ".coldvault" / "last-run.json").read_text(encoding="utf-8"))
@@ -113,8 +114,8 @@ class StatusTests(unittest.TestCase):
         code, out, _ = self.status()
         self.assertNotEqual(0, code)
         self.assertIn("stale", out)
-        self.assertIn("schedule: installed, next run due ", out)
-        self.assertIn("(every 1h)", out)
+        self.assertIn("(expected every 1h)", out)
+        self.assertNotIn("schedule: installed", out)
 
     def test_recent_success_with_an_hourly_schedule_is_fresh(self):
         self.assertEqual(0, self.sync()[0])

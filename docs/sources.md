@@ -16,7 +16,9 @@ By default Coldvault looks in `~/.claude/projects`, `~/.codex/sessions` and `~/.
 
 ## GitHub
 
-Public repositories are fetched by username without login, every page of them; lookup failure or no network simply skips them. GitHub allows 60 unauthenticated requests an hour, and each page holds 100 repositories. To raise that limit, set `GITHUB_TOKEN` to any GitHub token; it is sent only to `api.github.com` and is never printed or written to the vault. Each repository's project note also gets its README, the Markdown files at the top of its `docs/` folder and the titles and links of its first 100 open issues and pull requests, with the same credential redaction as transcripts. They are cached in `.coldvault/github.json`: a rerun fetches the README and docs again only when the repository's `pushed_at` changed, and asks for issues with the saved ETag. If the rate limit runs out, the run says so, keeps the repository list, and the next run fetches what is still missing.
+Public repositories are fetched by username without login, every page of them. If the listing fails, Coldvault keeps saved projects and their docs in the index and adds repositories from any pages it received. Status reports the incomplete sync. The next complete listing determines which repositories appear in the index.
+
+GitHub allows 60 unauthenticated requests an hour, and each page holds 100 repositories. To raise that limit, set `GITHUB_TOKEN` to any GitHub token; it is sent only to `api.github.com` and is never printed or written to the vault. Each repository's project note also gets its README, the Markdown files at the top of its `docs/` folder and the titles and links of its first 100 open issues and pull requests, with the same credential redaction as transcripts. They are cached in `.coldvault/github.json`: a rerun fetches the README and docs again only when the repository's `pushed_at` changed, and asks for issues with the saved ETag. If the rate limit runs out, the run says so, keeps the repository list, and the next run fetches what is still missing.
 
 ## Markdown folders
 
@@ -36,8 +38,10 @@ Pages land under `Imported/Notion/` without Notion's 32-character ID in their fi
 
 ## ChatGPT and Claude.ai exports
 
-For ChatGPT (Settings → Data controls → **Export data**) or Claude.ai (Settings → Privacy → **Export data**), pass the downloaded zip with `--chatgpt-export` or `--claude-export` (repeatable):
+Download your ChatGPT export from Settings → Data controls → **Export data**, or your Claude.ai export from Settings → Privacy → **Export data**. Enter each ZIP path at the corresponding `coldvault setup` prompt. Later runs of `coldvault sync --vault FOLDER`, including scheduled runs, read the saved paths. Replace a ZIP at its saved path when you download a fresh export.
+
+For a single run, pass `--chatgpt-export` or `--claude-export` (repeatable). Each flag replaces the saved list for its provider for that run.
 
     python3 coldvault.py --chatgpt-export ~/Downloads/chatgpt-export.zip --claude-export ~/Downloads/claude-export.zip --output ./ChatVault
 
-Each conversation becomes one session note under `Sessions/`, linked from a `ChatGPT` or `Claude.ai` project note and named by its conversation ID, so rerunning with the same zip adds nothing and a newer export adds only the conversations that are new (a conversation that grew is updated in place). The note holds the title and the user and assistant messages; tool output, system prompts, hidden messages and thinking are skipped, and the text is redacted like transcripts. Numbered `conversations-NNN.json` files are read too, and only the branch ChatGPT shows (its `current_node`) is imported when a reply was edited or regenerated. A zip without conversation files, or one in an unexpected format, fails the `chat-exports` source (exit status 3). Pass the latest export each time, since the index lists only the conversations from the exports passed on that run.
+Each conversation becomes one session note under `Sessions/`, linked from a `ChatGPT` or `Claude.ai` project note and named by its conversation ID. Rerunning with the same ZIP adds nothing. A newer export adds new conversations and updates existing conversations in place. Notes hold the title and the redacted user and assistant messages. Coldvault skips tool output, system prompts, hidden messages and thinking. It reads numbered `conversations-NNN.json` files and imports the branch ChatGPT shows (its `current_node`) when a reply was edited or regenerated. A missing or invalid saved ZIP fails the `chat-exports` source (exit status 3) and identifies the file. During that failure, conversations imported earlier stay in place and stay linked from their project notes.
