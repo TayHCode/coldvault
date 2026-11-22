@@ -11,7 +11,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
-import coldvault
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+try:
+    import coldvault
+finally:
+    sys.path.pop(0)
 
 KIT = Path(coldvault.__file__).resolve()
 SCRATCH = KIT.parent / ".scratch"
@@ -128,6 +132,84 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         self.assertIn(f"--vault {other}", lines[0])
         self.assertEqual(1, self.config(other)["schedule_hours"])
+
+    def test_doctor_reports_a_missing_expected_job_with_a_fresh_receipt(self):
+        vault = str(self.vault)
+        self.assertEqual(0, self.kit("sync", "--vault", vault)[0])
+        self.assertEqual(0, self.kit("schedule", "install", "--vault", vault)[0])
+        self.assertEqual(0, self.kit("doctor", "--vault", vault)[0])
+        self.crontab.unlink()
+        code, out, err = self.kit("doctor", "--vault", vault, "--json")
+        self.assertEqual(1, code, err or out)
+        report = json.loads(out)
+        self.assertEqual("fresh", report["sources"][0]["freshness"])
+        self.assertEqual({"expected_hours": 1, "state": "missing"}, report["schedule"])
+        self.assertIn("schedule: missing", self.kit("doctor", "--vault", vault)[1])
+
+    def test_doctor_checks_native_cadence_even_with_a_cron_timezone(self):
+        vault = str(self.vault)
+        self.assertEqual(0, self.kit("sync", "--vault", vault)[0])
+        self.assertEqual(0, self.kit("schedule", "--vault", vault)[0])
+        line, = self.cron_lines()
+        for zone, timing, expected in (("", "0 0 * * *", "unverified"),
+                                       ("CRON_TZ=UTC\n", "0 0 1 1 *", "unverified"),
+                                       ("CRON_TZ=UTC\n", "0 * * * *", "installed")):
+            with self.subTest(zone=zone, timing=timing):
+                self.crontab.write_text(zone + line.replace("0 * * * *", timing, 1) + "\n", encoding="utf-8")
+                code, out, err = self.kit("doctor", "--vault", vault, "--json")
+                self.assertEqual(0 if expected == "installed" else 1, code, err or out)
+                self.assertEqual(expected, json.loads(out)["schedule"]["state"])
+
+    def test_remove_after_config_loss_preserves_other_jobs_and_config_bytes(self):
+        self.crontab.write_bytes(USER_LINES.encode())
+        other = self.setup_vault("other", self.base / "input")
+        self.assertEqual(0, self.kit("schedule", "--vault", str(other))[0])
+        survivor = self.crontab.read_bytes()
+        config = self.vault / ".coldvault" / "config.json"
+        saved = config.read_bytes()
+        for damaged in (None, b"{", b"{}", b"\xff"):
+            with self.subTest(damaged=damaged):
+                config.write_bytes(saved)
+                self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault))[0])
+                if damaged is None:
+                    config.unlink()
+                else:
+                    config.write_bytes(damaged)
+                code, out, err = self.kit("schedule", "remove", "--vault", str(self.vault))
+                self.assertEqual(0, code, err or out)
+                self.assertEqual(survivor, self.crontab.read_bytes())
+                self.assertEqual(damaged, config.read_bytes() if config.exists() else None)
+
+    def test_repair_and_remove_owned_job_after_moving_the_kit(self):
+        self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault))[0])
+        current, = self.cron_lines()
+        _, tail = current.split(" sync --vault ", 1)
+        old = "37 9 * * 2 '/old venv/bin/python3' '/old kit/coldvault.py' sync --vault " + tail
+        for action in ("install", "remove"):
+            self.crontab.write_text(USER_LINES + old + "\n", encoding="utf-8")
+            code, _, err = self.kit("schedule", action, "--vault", str(self.vault))
+            self.assertEqual(0, code, err)
+            expected = USER_LINES + (current + "\n" if action == "install" else "")
+            self.assertEqual(expected.encode(), self.crontab.read_bytes())
+
+    def test_remove_lists_ambiguous_cron_candidates_without_editing(self):
+        self.assertEqual(0, self.kit("schedule", "--vault", str(self.vault))[0])
+        job, = self.cron_lines()
+        command, marker = job.rsplit(" #", 1)
+        wrong_path = job.replace(str(self.vault), str(self.vault) + "-other")
+        for candidates in ([job, job], [wrong_path], [command], [command + " #coldvault-schedule 000000000000"],
+                           ["0 * * * * /bin/true #" + marker], ["# " + job],
+                           [job.replace(str(KIT), "/other/backup.py")], [job.replace(sys.executable, "/bin/echo")],
+                           [command + " && /bin/true #" + marker]):
+            with self.subTest(candidates=candidates):
+                data = ("# user job\n" + "\n".join(candidates) + "\n").encode()
+                self.crontab.write_bytes(data)
+                code, _, err = self.kit("schedule", "remove", "--vault", str(self.vault))
+                self.assertEqual(2, code)
+                for number in range(2, 2 + len(candidates)):
+                    self.assertIn(f"line {number}", err)
+                self.assertEqual(data, self.crontab.read_bytes())
+                self.assertEqual(1, self.config()["schedule_hours"])
 
     def test_schedule_needs_setup_first(self):
         empty = self.base / "empty"

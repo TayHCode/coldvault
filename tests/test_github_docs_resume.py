@@ -38,7 +38,7 @@ class GitHubDocsResumeTests(unittest.TestCase):
             cli = github.GitHubSyncTests()
             base, first = cli.base(temporary), BudgetedGitHub()
             receipt = base / "vault" / ".coldvault" / "last-run.json"
-            cli.sync(base, first, expected_exit=3)
+            cli.sync(base, first, expected_exit=1)
             self.assertEqual(PREFIX + [SETUP], [req.full_url for req in first.requests])
             attempt = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertFalse(attempt["ok"])
@@ -60,10 +60,10 @@ class GitHubDocsResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=github.SCRATCH) as temporary:
             cli = github.GitHubSyncTests()
             base = cli.base(temporary)
-            cli.sync(base, BudgetedGitHub(), expected_exit=3)
+            cli.sync(base, BudgetedGitHub(), expected_exit=1)
 
             new_push = BudgetedGitHub(pushed="2026-11-02T10:00:00Z")
-            cli.sync(base, new_push, expected_exit=3)
+            cli.sync(base, new_push, expected_exit=1)
             self.assertEqual(PREFIX + [SETUP], [req.full_url for req in new_push.requests])
 
             retry = BudgetedGitHub(pushed=new_push.pushed)

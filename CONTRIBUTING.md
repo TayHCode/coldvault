@@ -6,4 +6,4 @@ Finish the first version before adding features. Its 12 required capabilities ar
 
 Report bugs and propose changes at https://github.com/TayHCode/coldvault/issues. For security issues, follow [SECURITY.md](SECURITY.md).
 
-Before each release, run the fresh-machine acceptance test as root in a new, throwaway Ubuntu VM with the release candidate: `sudo bash tests/acceptance.sh coldvault.py`. It follows README.md as a new user, from download to a scheduled run and `status`, and fails if that takes 10 minutes or more. After the release, run it without the argument to check the README download too.
+Before each release, run the fresh-machine acceptance test as root in a new, throwaway Ubuntu VM with the release candidate: `sudo python3 tests/acceptance.py coldvault.py`. It follows README.md as a new user, from download to a scheduled run and `status`, and fails if that takes 10 minutes or more. After the release, run it without the argument to check the README download too.

@@ -59,7 +59,7 @@ class ImportOutageTests(unittest.TestCase):
                     try:
                         expected = {**saved, page: page.read_bytes()}
                         sync = kit("sync", "--vault", str(vault))
-                        self.assertEqual(3, sync.returncode, sync.stderr)
+                        self.assertEqual(1, sync.returncode, sync.stderr)
                         status = kit("status", "--vault", str(vault))
                         self.assertEqual(1, status.returncode, status.stdout + status.stderr)
                         self.assertIn(f"{source}: failed", status.stdout + status.stderr)

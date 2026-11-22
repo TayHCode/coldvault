@@ -82,7 +82,7 @@ class SavedSourceTests(unittest.TestCase):
             moved = transcripts.rename(home / "moved")
             (notes / "Plan.md").write_text("# Plan\n\nPlant beans.\n", encoding="utf-8")
             sync = self.kit(home, "sync", "--vault", str(vault))
-            self.assertEqual(3, sync.returncode, sync.stderr)
+            self.assertEqual(1, sync.returncode, sync.stderr)
             self.assertIn("Plant beans.", (vault / "Imported/notes/Plan.md").read_text(encoding="utf-8"))
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertFalse(receipt["ok"])
@@ -121,7 +121,7 @@ class SavedSourceTests(unittest.TestCase):
 
                 importing.rename(home / "moved")
                 sync = self.kit(home, "sync", "--vault", str(vault))
-                self.assertEqual(3, sync.returncode, sync.stderr)
+                self.assertEqual(1, sync.returncode, sync.stderr)
                 receipt = json.loads((vault / ".coldvault" / "last-run.json").read_text(encoding="utf-8"))
                 self.assertEqual("failed", receipt["sources"][source]["state"])
                 self.assertEqual(daily_text, daily.read_text(encoding="utf-8") if daily.exists() else "")

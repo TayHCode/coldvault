@@ -13,7 +13,7 @@ A source is `fn(run)` and returns one of:
 - `None` when it has nothing to do this run (for example, it isn't configured). The run records the source as `skipped`.
 - A list of `(path, text, metadata)` tuples, one per note. The run records `ok` with the count.
 
-Or it raises `coldvault.SourceError("reason")` when it can't do its job. The run records `failed (reason)`, exits 3, and still writes the notes from the other sources.
+Or it raises `coldvault.SourceError("reason")` when it can't do its job. The run records `failed (reason)`, exits 1, and still writes the notes from the other sources.
 
 - `path` is the note's path inside the vault, using `/`. Put imported notes under `run.folders['imported']`, so a renamed folder (see [customize.md](customize.md)) applies to them. Build file names with `coldvault.slug(...)`, so they can't escape their folder.
 - `text` is the Markdown body. Coldvault adds the frontmatter. Pass anything a person typed through `coldvault.redact(...)`, the same redaction the other sources use.

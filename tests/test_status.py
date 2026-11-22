@@ -37,7 +37,8 @@ class StatusTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         network = patch.object(coldvault, "urlopen", side_effect=urlopen or URLError("network is unreachable"))
         code = 0
-        with patch.dict(os.environ, env or {}, clear=True), patch.object(sys, "argv", ["coldvault", *argv]), network, \
+        with patch.dict(os.environ, {"HOME": str(self.base), **(env or {})}, clear=True), \
+                patch.object(sys, "argv", ["coldvault", *argv]), network, \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 coldvault.main()
@@ -57,7 +58,7 @@ class StatusTests(unittest.TestCase):
 
     def test_offline_github_fails_the_run_and_status(self):
         code, _, err = self.sync("synthetic-user")
-        self.assertEqual(3, code)
+        self.assertEqual(1, code)
         self.assertIn("github: failed", err)
         self.assertTrue((self.vault / "Index.md").is_file())
         receipt = self.receipt()
@@ -231,7 +232,7 @@ class StatusTests(unittest.TestCase):
             raise URLError(f"refused with {request.get_header('Authorization')}")
 
         code, out, err = self.sync("synthetic-user", urlopen=leak, env={"GITHUB_TOKEN": TOKEN})
-        self.assertEqual(3, code)
+        self.assertEqual(1, code)
         self.assertNotIn(TOKEN, out + err)
         status_code, status_out, status_err = self.status()
         self.assertNotEqual(0, status_code)
@@ -243,7 +244,7 @@ class StatusTests(unittest.TestCase):
 
     def test_malformed_token_is_a_failure_not_a_skip(self):
         code, _, err = self.sync("synthetic-user", env={"GITHUB_TOKEN": "ghp_bad token"})
-        self.assertEqual(3, code)
+        self.assertEqual(1, code)
         self.assertEqual("failed", self.receipt()["sources"]["github"]["state"])
         self.assertNotIn("bad token", json.dumps(self.receipt()) + err)
 

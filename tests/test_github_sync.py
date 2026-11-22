@@ -9,7 +9,11 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-import coldvault
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+try:
+    import coldvault
+finally:
+    sys.path.pop(0)
 
 
 SCRATCH = Path(__file__).resolve().parents[1] / ".scratch"
@@ -97,6 +101,33 @@ class GitHubSyncTests(unittest.TestCase):
         self.assertEqual(expected_exit, exit_code, out.getvalue() + err.getvalue())
         return out.getvalue() + err.getvalue()
 
+    def test_doctor_distinguishes_github_summaries_for_different_local_projects(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            base = self.base(temporary)
+            record = {"type": "user", "cwd": "/other/demo", "message": {"role": "user", "content": "Another project"}}
+            (base / "input" / "another.jsonl").write_text(json.dumps(record), encoding="utf-8")
+            self.sync(base, FakeGitHub())
+            vault = base / "vault"
+            projects = sorted((vault / "Projects").glob("*.md"))
+            self.assertEqual(2, len(projects))
+            for path in projects:
+                self.assertIn('repo: "synthetic-user/demo"', path.read_text(encoding="utf-8"))
+
+            argv = ["coldvault.py", "doctor", "--vault", str(vault), "--json"]
+            for copies in (0, 1):
+                with patch.dict(os.environ, HOME=str(base)), patch.object(sys, "argv", argv), \
+                        contextlib.redirect_stdout(io.StringIO()) as printed:
+                    with self.assertRaises(SystemExit) as raised:
+                        coldvault.main()
+                self.assertEqual(copies, raised.exception.code, printed.getvalue())
+                self.assertEqual({"schema_version": 1, "schedule": {"expected_hours": None, "state": "not_configured"},
+                                  "sources": [
+                    {"source": "transcripts", "freshness": "fresh", "duplicates": 0},
+                    {"source": "github", "freshness": "fresh", "duplicates": copies},
+                ]}, json.loads(printed.getvalue()))
+                if not copies:
+                    projects[0].with_name("duplicate.md").write_bytes(projects[0].read_bytes())
+
     def base(self, temporary):
         base = Path(temporary)
         (base / "input").mkdir()
@@ -150,7 +181,7 @@ class GitHubSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             base, fake = self.base(temporary), FakeGitHub()
             fake.limited = True
-            output = self.sync(base, fake, expected_exit=3)
+            output = self.sync(base, fake, expected_exit=1)
             self.assertIn("rate limit", output)
             note = (base / "vault" / "Projects" / "demo.md").read_text(encoding="utf-8")
             self.assertIn("A demo", note)
@@ -165,7 +196,7 @@ class GitHubSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             base, fake = self.base(temporary), FakeGitHub()
             fake.fail = {ISSUES: (403, {"X-RateLimit-Remaining": "0"})}
-            self.assertIn("rate limit", self.sync(base, fake, expected_exit=3))
+            self.assertIn("rate limit", self.sync(base, fake, expected_exit=1))
             self.assertIn("## README", (base / "vault" / "Projects" / "demo.md").read_text(encoding="utf-8"))
             fake.fail, fake.requests = {}, []
             self.sync(base, fake)
@@ -176,7 +207,7 @@ class GitHubSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             base, fake = self.base(temporary), FakeGitHub()
             fake.fail = {REPO + "/contents/docs": (429, {})}
-            self.assertIn("rate limit", self.sync(base, fake, expected_exit=3))
+            self.assertIn("rate limit", self.sync(base, fake, expected_exit=1))
             self.assertIn("## README", (base / "vault" / "Projects" / "demo.md").read_text(encoding="utf-8"))
             fake.fail, fake.requests = {}, []
             self.sync(base, fake)
@@ -189,7 +220,7 @@ class GitHubSyncTests(unittest.TestCase):
             self.sync(base, fake)
             fake.pushed = "2026-11-02T10:00:00Z"
             fake.fail = {REPO + "/readme": (404, {}), REPO + "/contents/docs": (429, {})}
-            self.sync(base, fake, expected_exit=3)
+            self.sync(base, fake, expected_exit=1)
             note = (base / "vault" / "Projects" / "demo.md").read_text(encoding="utf-8")
             self.assertIn("## README", note)
             self.assertIn("## docs/guide.md", note)
@@ -211,7 +242,7 @@ class GitHubSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             base, fake = self.base(temporary), FakeGitHub()
             fake.fail = {REPO + "/readme": (500, {})}
-            output = self.sync(base, fake, expected_exit=3)
+            output = self.sync(base, fake, expected_exit=1)
             self.assertIn("synthetic-user/demo", output)
             self.assertIn("HTTP Error 500", output)
             self.assertNotIn(TOKEN, output)
@@ -240,7 +271,7 @@ class GitHubSyncTests(unittest.TestCase):
                 fake.readme = "# Demo\n\nUpdated install instructions.\n"
                 fake.fail[url] = (code, {})
                 with patch.object(coldvault, "_utc_now", return_value="2026-11-02T10:00:00Z"):
-                    self.sync(base, fake, expected_exit=3)
+                    self.sync(base, fake, expected_exit=1)
                 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                 self.assertFalse(receipt["ok"])
                 self.assertEqual("2026-11-01T10:00:00Z", receipt["last_success"])
@@ -305,7 +336,7 @@ class GitHubSyncTests(unittest.TestCase):
         vault = base / "vault"
         receipt_path = vault / ".coldvault" / "last-run.json"
         previous = json.loads(receipt_path.read_text(encoding="utf-8"))["last_success"]
-        self.sync(base, fake, expected_exit=0 if complete else 3)
+        self.sync(base, fake, expected_exit=0 if complete else 1)
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         self.assertEqual(complete, receipt["ok"])
         self.assertEqual("ok" if complete else "failed", receipt["sources"]["github"]["state"])

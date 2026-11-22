@@ -80,6 +80,21 @@ class SessionIdentityTests(unittest.TestCase):
                     self.assertEqual(first_body, legacy.read_bytes())
                     second, = [note for note in notes if note != legacy]
                     self.assertIn("Second session", second.read_text(encoding="utf-8"))
+                if case in ("filename fallback", "divergent copies", "successive divergent copies"):
+                    argv = ["coldvault.py", "doctor", "--vault", str(output), "--json"]
+                    for copies in (0, 1):
+                        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()) as printed:
+                            with self.assertRaises(SystemExit) as raised:
+                                coldvault.main()
+                        self.assertEqual(copies, raised.exception.code, printed.getvalue())
+                        self.assertEqual({"schema_version": 1, "schedule": {"expected_hours": None, "state": "not_configured"},
+                                          "sources": [
+                            {"source": "transcripts", "freshness": "fresh", "duplicates": copies}
+                        ]}, json.loads(printed.getvalue()))
+                        if not copies:
+                            duplicate = second.with_name("duplicate.md")
+                            duplicate.write_bytes(second.read_bytes())
+                    duplicate.unlink()
                 if case == "divergent copies":
                     (source / "copy.jsonl").unlink()
                 moved = source / "moved"

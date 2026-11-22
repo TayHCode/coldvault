@@ -250,7 +250,7 @@ class SetupTests(unittest.TestCase):
             env_proxy = {"https_proxy": "http://localhost:9", "HTTPS_PROXY": "http://localhost:9"}
             with patch.dict(os.environ, env_proxy):
                 failed = self.kit(home, "sync", "--vault", str(vault))
-            self.assertEqual(3, failed.returncode, failed.stderr)
+            self.assertEqual(1, failed.returncode, failed.stderr)
             self.assertEqual(plan, (vault / "Imported" / "My Notes" / "Plan.md").read_bytes())
 
             self.write_config(vault, transcripts, [], folders={"imported": "Archive"})

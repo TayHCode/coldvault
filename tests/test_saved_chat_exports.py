@@ -75,7 +75,7 @@ class SavedChatExportTests(unittest.TestCase):
                     if export == claude:
                         claude.write_text("Invalid ZIP", encoding="utf-8")
                     sync = self.kit(home, "sync", "--vault", str(vault))
-                    self.assertEqual(3, sync.returncode, sync.stderr)
+                    self.assertEqual(1, sync.returncode, sync.stderr)
                     self.assertIn(f"{export.name}:", sync.stderr)
                     self.assertIn(diagnostic, sync.stderr)
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))

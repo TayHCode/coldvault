@@ -11,7 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import coldvault
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+try:
+    import coldvault
+finally:
+    sys.path.pop(0)
 
 
 class LaunchAgentTests(unittest.TestCase):
@@ -114,6 +118,14 @@ class LaunchAgentTests(unittest.TestCase):
         self.fail_print = True
         self.assertIn("schedule: unknown (expected every 1h)", self.status())
 
+    def test_doctor_checks_loaded_interval_against_saved_interval(self):
+        self.install()
+        (_, job), = self.jobs.values()
+        job["StartCalendarInterval"] = [{"Hour": 0, "Minute": 0}]
+        code, out, err = self.cli(coldvault.doctor_main, "--json")
+        self.assertEqual(1, code, err)
+        self.assertEqual({"expected_hours": 1, "state": "unverified"}, json.loads(out)["schedule"])
+
     def test_bootstrap_failure_restores_previous_schedule(self):
         self.install()
         self.fail_bootstrap = True
@@ -143,6 +155,42 @@ class LaunchAgentTests(unittest.TestCase):
         code, _, error = self.cli(coldvault.schedule_main, "remove")
         self.assertEqual(0, code, error)
         self.assertEqual({}, self.jobs)
+
+    def test_remove_with_corrupt_config_checks_loaded_and_saved_ownership(self):
+        self.install()
+        service, = self.jobs
+        path, job = self.jobs[service]
+        self.config.write_bytes(b"{")
+        for changed in ("loaded arguments", "saved arguments", "saved label", "invalid plist"):
+            with self.subTest(changed=changed):
+                foreign = {**job, "ProgramArguments": [*self.command[:-1], str(self.home / "other")]}
+                self.jobs[service] = (path, foreign if changed == "loaded arguments" else job)
+                saved = (b"{" if changed == "invalid plist" else plistlib.dumps(
+                    foreign if changed == "saved arguments" else
+                    {**job, "Label": "another.job"} if changed == "saved label" else job))
+                path.write_bytes(saved)
+                code, _, err = self.cli(coldvault.schedule_main, "remove")
+                self.assertEqual(2, code)
+                self.assertIn(str(path), err)
+                self.assertIn(service, self.jobs)
+                self.assertEqual(saved, path.read_bytes())
+        path.write_bytes(plistlib.dumps(job))
+        code, _, err = self.cli(coldvault.schedule_main, "remove")
+        self.assertEqual(0, code, err)
+        self.assertFalse(path.exists())
+        self.assertFalse(self.jobs)
+        self.assertEqual(b"{", self.config.read_bytes())
+
+    def test_remove_owned_job_after_moving_the_kit(self):
+        self.install()
+        (path, job), = self.jobs.values()
+        job["ProgramArguments"][:2] = ["/old venv/bin/python3", "/old kit/coldvault.py"]
+        path.write_bytes(plistlib.dumps(job))
+        self.config.unlink()
+        code, _, err = self.cli(coldvault.schedule_main, "remove")
+        self.assertEqual(0, code, err)
+        self.assertFalse(path.exists())
+        self.assertFalse(self.jobs)
 
     def test_remove_refuses_a_job_loaded_from_another_path(self):
         self.install()

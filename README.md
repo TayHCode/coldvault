@@ -7,9 +7,9 @@ Build a private Obsidian vault from your Claude Code and Codex conversations and
 Download the script into a `coldvault` folder in your home folder:
 
     mkdir -p ~/coldvault && cd ~/coldvault
-    curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v0.3.0/coldvault.py
+    curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v0.4.0/coldvault.py
 
-Check the download with `shasum -a 256 coldvault.py` on macOS or `sha256sum coldvault.py` on Linux. The SHA-256 for v0.3.0 is `b2ac69e2c44e098929ce02cac6d85dac86c24519bb0659da85ed0e6b574e7684`.
+Check the download with `shasum -a 256 coldvault.py` on macOS or `sha256sum coldvault.py` on Linux. The SHA-256 for v0.4.0 is `6a86cc65fb27c71ee47fe78c108e819146663c3556e368ddcf85e57f4d936e57`.
 
 Or, if you have git, clone the repository instead. The clone also holds the examples used below:
 
@@ -60,9 +60,9 @@ Claude Code deletes transcripts after `cleanupPeriodDays` days (30 by default). 
 
     python3 ~/coldvault/coldvault.py status --vault ~/ColdvaultVault
 
-It prints each source as `ok`, `failed (reason)` or `skipped`, the time of the last fully successful run, and when the next scheduled run is due. The due time can be `unknown`, for example with a `CRON_TZ` override or a daily schedule near a daylight saving change. It exits 0 when the last run succeeded, and 1 when it failed or no run has succeeded for twice the schedule interval.
+It prints each source as `ok`, `failed (reason)` or `skipped`, the time of the last fully successful run, and when the next scheduled run is due. The due time can be `unknown`, for example with a `CRON_TZ` override or a daily schedule near a daylight saving change. It exits 0 for a current successful run, 1 when a run is missing, failed, stale or needs attention, and 2 for errors such as an invalid receipt or config.
 
-To search the vault from a terminal, run `python3 coldvault.py search TERM --vault ~/ColdvaultVault` (add `--json` for JSON).
+To search the vault from a terminal, run `python3 coldvault.py search TERM --vault ~/ColdvaultVault`. Run `python3 coldvault.py doctor --vault ~/ColdvaultVault` to check source freshness, duplicates and the configured schedule. For scripts, see the [JSON formats and exit codes](docs/vault.md#cli-json).
 
 ## Sync it to other devices
 
@@ -72,7 +72,7 @@ To reach your vault on other devices, see [Sync it to other devices](docs/sync.m
 
 Uninstalling removes Coldvault, not your vault. The notes are yours and stay: they are plain Markdown files that Obsidian opens without Coldvault. Delete the vault folder yourself only if you no longer want them.
 
-First stop the schedule, while the vault still has its saved setup. If you set it up with `schedule`, remove it:
+First stop the schedule. If you used `schedule`, remove the job by its original vault path, even if its config is missing or corrupt:
 
     python3 ~/coldvault/coldvault.py schedule remove --vault ~/ColdvaultVault
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- **Breaking:** `coldvault search --json` now returns an object with `schema_version: 1` and a `hits` array. Scripts that read the previous bare array must read `hits`.
+- A sync that finishes with a failed source now exits 1 (previously 3). The JSON receipt identifies the failed source. Runtime and usage errors exit 2.
+- `status --json` reports the sync receipt and schedule. `doctor --json` reports source freshness, duplicates and schedule health. See the [CLI JSON reference](docs/vault.md#cli-json).
+
 ## 0.3.0
 
 - On macOS, `schedule install` creates a LaunchAgent for the vault. `status` reads the loaded job and shows the next scheduled run, and `schedule remove` removes the job.
@@ -36,4 +42,4 @@ First tagged release.
 - `coldvault search TERM --vault VAULT` searches the vault (`--json` for JSON), ranked by SQLite full-text search when your Python includes it.
 - Transcript imports replace common credential formats (API keys, tokens, private keys, passwords) with `[REDACTED]`.
 - Guides for adding a source, customizing the vault, syncing it to other devices, uninstalling and recovering.
-- `tests/acceptance.sh` follows the README as a new user on a fresh Ubuntu machine.
+- `tests/acceptance.py` follows the README as a new user on a fresh Ubuntu machine.

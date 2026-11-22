@@ -1,0 +1,9 @@
+lock-version = "1.0"
+created-by = "uv"
+requires-python = ">=3.9"
+
+[[packages]]
+name = "setuptools"
+version = "82.0.1"
+sdist = { url = "https://files.pythonhosted.org/packages/4f/db/cfac1baf10650ab4d1c111714410d2fbb77ac5a616db26775db562c8fab2/setuptools-82.0.1.tar.gz", upload-time = 2026-03-09T12:47:17Z, size = 1152316, hashes = { sha256 = "7d872682c5d01cfde07da7bccc7b65469d3dca203318515ada1de5eda35efbf9" } }
+wheels = [{ url = "https://files.pythonhosted.org/packages/9d/76/f789f7a86709c6b087c5a2f52f911838cad707cc613162401badc665acfe/setuptools-82.0.1-py3-none-any.whl", upload-time = 2026-03-09T12:47:15Z, size = 1006223, hashes = { sha256 = "a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb" } }]

@@ -269,7 +269,7 @@ class VaultKitTests(unittest.TestCase):
                 with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()) as printed:
                     with self.assertRaises(SystemExit) as raised:
                         coldvault.main()
-                return raised.exception.code, json.loads(printed.getvalue())
+                return raised.exception.code, json.loads(printed.getvalue())["hits"]
 
             self.assertEqual((0, [{"path": "Notes/a.md", "line": 2, "text": "Findable needle here"}]), run("needle"))
             self.assertEqual((1, []), run("absent"))
@@ -1442,7 +1442,7 @@ class ChatExportTests(unittest.TestCase):
                                      "author": {"role": "user"}, "content": {"content_type": "text", "parts": "hello"}}}}}]))):
                 with self.subTest(export=export.name), self.assertRaises(SystemExit) as raised:
                     self.run_kit(base, flag, str(export), "--output", str(base / "vault"))
-                self.assertEqual(3, raised.exception.code)
+                self.assertEqual(1, raised.exception.code)
                 receipt = json.loads((base / "vault" / ".coldvault" / "last-run.json").read_text(encoding="utf-8"))
                 self.assertEqual("failed", receipt["sources"]["chat-exports"]["state"])
 
@@ -2115,7 +2115,7 @@ class VaultTemplateTests(unittest.TestCase):
                         self.assertTrue((output / f"{target}.md").is_file())
             result = subprocess.run([sys.executable, str(KIT / "coldvault.py"), "search", "--json", "frontmatter", "--vault", str(output)], capture_output=True, text=True, timeout=60)
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("Home.md", [hit["path"] for hit in json.loads(result.stdout)])
+            self.assertIn("Home.md", [hit["path"] for hit in json.loads(result.stdout)["hits"]])
 
     def test_rebuilding_keeps_user_edits_and_deletions_in_template_notes(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:

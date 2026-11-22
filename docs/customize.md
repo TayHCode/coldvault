@@ -98,3 +98,23 @@ That runs every 6 hours. On a Mac, set `StartInterval` in the launchd file to th
 When you schedule by hand, set `schedule_hours` in `config.json` to the interval in whole hours (`6` here). Rerunning `setup` preserves this value. `python3 coldvault.py status --vault FOLDER` uses it as the expected interval. If the last successful run was more than twice that interval ago, `status` reports `stale` and exits 1.
 
 To change when a manually scheduled job runs, use the locked crontab editor above on Linux or update the launchd plist on macOS.
+
+## Preservation receipts
+
+Coldvault normally imports a redacted conversation into a session note. To also keep the complete, unredacted transcript and issue a receipt, add this setting to the vault configuration:
+
+```json
+"preservation_receipts": {
+  "host": "laptop",
+  "folder": "/absolute/path/to/receipts",
+  "archive_folder": "/absolute/path/to/originals"
+}
+```
+
+Use the host name your cleanup tool uses. Choose private folders outside the vault and outside any directory subject to cleanup. The archive folder's parent must already exist. Coldvault creates both folders with mode `700`. Existing folders must belong to you and disallow writes by others. With only `folder` and `host` configured, sync still imports conversations and issues no new receipts. Setup preserves these settings.
+
+For each eligible transcript, sync stores the exact bytes at `<archive_folder>/<sha256>` with mode `600`. This copy includes tool output and any credentials present in the original. Sync reads it back, compares every byte and flushes the archive before writing a mode-`600` receipt at `<folder>/<SHA-256 of "HOST:PATH">.json`. Identical originals share one archive file. Each changed version has its own file.
+
+A version 2 receipt contains `schema_version` (the integer `2`), `host`, `path` (absolute source path), `sha256` (source digest), `destination` (absolute archive file path), and `verified_at` (UTC verification time). Copy the file at `destination` to restore the original and compare its SHA-256 with the receipt.
+
+Sync issues a receipt only for a complete transcript whose source succeeded and whose session note still matches the import. An incomplete record, changed source or edited note can leave an older receipt in place. Before removal, a compatible cleanup tool must reject older or unknown receipt versions and check the host, source path, current source digest and the independent archive at the recorded destination. Version 1 receipts only record a conversation import.
