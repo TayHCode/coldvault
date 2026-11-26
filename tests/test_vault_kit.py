@@ -640,6 +640,27 @@ class VaultKitTests(unittest.TestCase):
         self.assertIn("https://ops:" + coldvault.REDACTED + "@host.example.test?email=" + email, session)
         self.assertIn(kept, session)
 
+    def test_imported_transcripts_redact_claude_oat02_oauth_tokens(self):
+        oat_body = "Ab3" * 12
+        standalone_body = "Zx9" * 8
+        full_oauth = "sk-" + "ant-" + "oat02-" + oat_body
+        env_key = "CLAUDE_CODE_OAUTH_" + "TOKEN"
+        standalone = "oat02-" + standalone_body
+        probe = "\n".join([
+            "token " + full_oauth + " end",
+            env_key + "=" + full_oauth,
+            env_key + "=" + standalone,
+            env_key + '="' + standalone + '"',
+        ])
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            _, output = self.build_vault(Path(temporary), probe)
+            session = next((output / "Sessions").glob("*.md")).read_text(encoding="utf-8")
+        for leaked in (oat_body, standalone_body, full_oauth, standalone):
+            self.assertNotIn(leaked, session)
+        self.assertIn("token " + coldvault.REDACTED + " end", session)
+        self.assertIn(env_key + "=" + coldvault.REDACTED, session)
+        self.assertIn(env_key + '="' + coldvault.REDACTED + '"', session)
+
     def test_edited_managed_note_is_kept_and_linked_without_a_copy(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
             source, output = self.build_vault(Path(temporary), "Synthetic")
@@ -1911,7 +1932,7 @@ class ReadmeTests(unittest.TestCase):
     def test_quickstart_downloads_the_script_with_curl_before_any_git_step(self):
         script = Path(coldvault.__file__)
         version = coldvault.__version__
-        curl = f"curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v{version}/{script.name}"
+        curl = f"curl -fLO https://raw.githubusercontent.com/coldstack-dev/coldvault/v{version}/{script.name}"
         self.assertIn(curl, self.commands)
         first_git = next(i for i, command in enumerate(self.commands) if command.startswith("git "))
         self.assertLess(self.commands.index(curl), first_git)
@@ -2054,7 +2075,7 @@ class LegacyNameTests(unittest.TestCase):
         self.assertEqual("True []\n", result.stdout)
 
     def test_security_and_contributing_name_coldvault_and_a_public_contact_path(self):
-        issues = "https://github.com/TayHCode/coldvault/issues"
+        issues = "https://github.com/coldstack-dev/coldvault/issues"
         for name in ("SECURITY.md", "CONTRIBUTING.md"):
             with self.subTest(name=name):
                 text = (KIT / name).read_text(encoding="utf-8")

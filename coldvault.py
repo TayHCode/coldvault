@@ -114,9 +114,13 @@ def conversation(record):
     return None
 
 
+def _jsonl_lines(text):
+    return [line.removesuffix("\r") for line in text.split("\n")]
+
+
 def _complete_jsonl(data):
     try:
-        for line in data.decode("utf-8").splitlines():
+        for line in _jsonl_lines(data.decode("utf-8")):
             if line.strip():
                 json.loads(line, parse_constant=_reject_constant)
     except ValueError:
@@ -131,7 +135,7 @@ def _reject_constant(name):
 def transcript_info(path, data=None):
     lines, dates, project, named = [], [], (path.parent.name, path.parent.name), False
     source, session_id = None, None
-    for line in (path.read_bytes() if data is None else data).decode("utf-8", errors="replace").splitlines():
+    for line in _jsonl_lines((path.read_bytes() if data is None else data).decode("utf-8", errors="replace")):
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -279,15 +283,18 @@ def _is_managed_note(path):
     if path.is_symlink() or not path.is_file():
         return False
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
     except (OSError, UnicodeError):
         return False
-    lines = text.split("\n")
+    lines = text.split(os.linesep)
     fields = [field for marker, field in _MARKERS.items() if marker in lines[:3]]
     if len(fields) != 1:
         return False
     hashed = [index for index, line in enumerate(lines[:3]) if line.startswith(fields[0])]
     if len(hashed) != 1:
+        return False
+    if "\n".join(lines).replace("\n", os.linesep).encode("utf-8") != raw:
         return False
     recorded = lines.pop(hashed[0])[len(fields[0]):]
     return recorded == _digest("\n".join(lines))
@@ -1338,7 +1345,12 @@ def fts5_available():
 
 def setup_main(argv):
     parser = _CommandParser(argv, prog=f"{Path(sys.argv[0]).name} setup", description="Check prerequisites, choose your sources and save them in <vault>/.coldvault/config.json, then build the vault.")
+    parser.add_argument("--yes", action="store_true", help="Accept detected defaults without prompting (requires --vault)")
+    parser.add_argument("--vault", help="Vault folder to configure (required with --yes)")
+    parser.add_argument("--username", help="GitHub username for a public repository lookup (optional)")
     args = parser.parse_args(argv)
+    if args.yes and not (args.vault and args.vault.strip()):
+        parser.error("--yes requires --vault")
     output_stream = sys.stderr if args.json else sys.stdout
 
     def ask(prompt):
@@ -1365,18 +1377,28 @@ def setup_main(argv):
             print(f"{folder}: {sum(1 for _ in folder.rglob('*.jsonl'))} sessions", file=output_stream)
         else:
             print(f"{folder}: not found", file=output_stream)
-    output = ask("Folder for your Obsidian vault (new or existing): ")
+    output = args.vault.strip() if args.vault is not None else ask("Folder for your Obsidian vault (new or existing): ")
     if not output:
         parser.error("choose a vault folder")
     root = Path(output).expanduser().resolve()
     saved = _load_config(parser, root)
-    transcripts = found if found and ask("Import the session folders found above? [Y/n]: ").lower() in ("", "y", "yes") else []
-    transcripts += ask_many("Another transcript folder (Enter to finish): ")
-    notes = ask_many("Markdown notes folder to import (Enter to finish): ")
-    notion_exports = ask_many("Notion export .zip or folder to import (Enter to finish): ")
-    username = ask("GitHub username (optional): ")
-    chatgpt_exports = ask_many("ChatGPT export .zip to import (Enter to finish): ")
-    claude_exports = ask_many("Claude.ai export .zip to import (Enter to finish): ")
+    if args.yes:
+        if saved is not None:
+            parser.error(f"saved config already exists at {_config_path(root)}; run interactive setup or edit it directly instead of --yes")
+        transcripts = list(found)
+        notes = []
+        notion_exports = []
+        username = args.username.strip() if args.username is not None else ""
+        chatgpt_exports = []
+        claude_exports = []
+    else:
+        transcripts = found if found and ask("Import the session folders found above? [Y/n]: ").lower() in ("", "y", "yes") else []
+        transcripts += ask_many("Another transcript folder (Enter to finish): ")
+        notes = ask_many("Markdown notes folder to import (Enter to finish): ")
+        notion_exports = ask_many("Notion export .zip or folder to import (Enter to finish): ")
+        username = args.username.strip() if args.username is not None else ask("GitHub username (optional): ")
+        chatgpt_exports = ask_many("ChatGPT export .zip to import (Enter to finish): ")
+        claude_exports = ask_many("Claude.ai export .zip to import (Enter to finish): ")
     try:
         _check_sources(root, notes, notion_exports, transcripts, chatgpt_exports + claude_exports)
     except SourceError as error:

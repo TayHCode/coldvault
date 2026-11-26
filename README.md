@@ -7,13 +7,13 @@ Build a private Obsidian vault from your Claude Code and Codex conversations and
 Download the script into a `coldvault` folder in your home folder:
 
     mkdir -p ~/coldvault && cd ~/coldvault
-    curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v0.4.0/coldvault.py
+    curl -fLO https://raw.githubusercontent.com/coldstack-dev/coldvault/v0.4.0/coldvault.py
 
 Check the download with `shasum -a 256 coldvault.py` on macOS or `sha256sum coldvault.py` on Linux. The SHA-256 for v0.4.0 is `6a86cc65fb27c71ee47fe78c108e819146663c3556e368ddcf85e57f4d936e57`.
 
 Or, if you have git, clone the repository instead. The clone also holds the examples used below:
 
-    git clone https://github.com/TayHCode/coldvault.git ~/coldvault
+    git clone https://github.com/coldstack-dev/coldvault.git ~/coldvault
     cd ~/coldvault
 
 To get a `coldvault` command instead of `python3 coldvault.py`, run `pipx install .` from the clone ([pipx](https://pipx.pypa.io)). It takes the same options.
@@ -24,7 +24,7 @@ Run the guided setup:
 
     python3 coldvault.py setup
 
-It checks your Python version and whether SQLite full-text search is available, and shows how many sessions it found in `~/.claude/projects`, `~/.codex/sessions` and `~/.codex/archived_sessions`. Then it asks for the vault folder (new or existing; your files are kept), which transcript and Markdown folders to import, optional ChatGPT and Claude.ai export ZIPs, and an optional GitHub username for your public repositories. It saves the answers, and no secrets, in `<vault>/.coldvault/config.json` and builds the vault. Run `setup` again to change them.
+It checks your Python version and whether SQLite full-text search is available, and shows how many sessions it found in `~/.claude/projects`, `~/.codex/sessions` and `~/.codex/archived_sessions`. Then it asks for the vault folder (new or existing; your files are kept), which transcript and Markdown folders to import, optional ChatGPT and Claude.ai export ZIPs, and an optional GitHub username for your public repositories. It saves the answers, and no secrets, in `<vault>/.coldvault/config.json` and builds the vault. Run `setup` again to change them. For scripts or agents without a terminal, run `python3 coldvault.py setup --yes --vault ~/ColdvaultVault` (add `--username NAME` for public GitHub repositories; refuses if a saved config already exists).
 
 Transcript imports keep the conversation text, skip tool output, and replace common credential formats (API keys, tokens, private keys, passwords) with `[REDACTED]`.
 
@@ -124,6 +124,8 @@ Deleting the whole `.coldvault/` folder also rebuilds the index, but it forgets 
 **Restoring original transcripts.** Coldvault setup and sync leave originals at their source. To keep selected originals after the source expires, follow the [opt-in private backup and restore steps](docs/sync.md#back-up-and-restore-original-transcripts).
 
 ## Privacy
+
+No telemetry. Network: optional public GitHub API (`api.github.com`) lookups only when a username is given; writes local lock and fallback cache files under `~/.cache/coldvault` (or `${XDG_CACHE_HOME:-~/.cache}/coldvault` for read-only search fallback, plus `~/.cache/coldvault-schedule.lock` when using `schedule`).
 
 The vault contains your own conversations. Keep it private like the transcripts it comes from. The script writes only inside the output folder you choose, plus the search index, which holds a copy of your notes' text.
 

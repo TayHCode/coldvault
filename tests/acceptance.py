@@ -55,7 +55,7 @@ def main():
     run("install", "-d", *owner, home / ".claude", projects)
     run("install", *owner, "-m", "600", KIT / "examples/transcripts/claude/demo-session.jsonl", projects)
     version = re.search(r'^__version__ = "(\d+\.\d+\.\d+)"$', (KIT / "coldvault.py").read_text(), re.M).group(1)
-    download = f"curl -fLO https://raw.githubusercontent.com/TayHCode/coldvault/v{version}/coldvault.py"
+    download = f"curl -fLO https://raw.githubusercontent.com/coldstack-dev/coldvault/v{version}/coldvault.py"
     if args.candidate is None:
         step("mkdir -p ~/coldvault && cd ~/coldvault", download)
     else:

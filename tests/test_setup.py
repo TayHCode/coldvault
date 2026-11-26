@@ -327,6 +327,101 @@ class SetupTests(unittest.TestCase):
             self.assertIn("is not a Coldvault config", result.stderr)
             self.assertEqual('{"theme": "mine"}', config.read_text(encoding="utf-8"))
 
+    def kit_devnull(self, home, *argv):
+        env = {**os.environ, "HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1"}
+        env.pop("GITHUB_TOKEN", None)
+        return subprocess.run([sys.executable, str(KIT), *argv], stdin=subprocess.DEVNULL, env=env,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_setup_yes_succeeds_without_tty_or_prompts(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            home = Path(temporary)
+            transcripts, _ = self.make_home(home)
+            vault = home / "vault"
+            result = self.kit_devnull(home, "setup", "--yes", "--vault", str(vault))
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn(f"{transcripts}: 1 sessions", result.stdout)
+            self.assertNotIn("Folder for your Obsidian vault", result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stdout + result.stderr)
+            config = json.loads((vault / ".coldvault" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual({"version": 1, "transcripts": [str(transcripts)], "notes": [],
+                              "notion_exports": [], "chatgpt_exports": [], "claude_exports": [], "username": ""}, config)
+            self.assertIn("- [[Projects/demo]]", (vault / "Index.md").read_text(encoding="utf-8"))
+
+            json_vault = home / "vault-json"
+            json_result = self.kit_devnull(home, "setup", "--yes", "--vault", str(json_vault), "--json")
+            self.assertEqual(0, json_result.returncode, json_result.stderr)
+            receipt = json.loads(json_result.stdout)
+            self.assertTrue(receipt["ok"])
+            self.assertEqual({"state": "ok", "count": 1}, receipt["sources"]["transcripts"])
+
+            empty_home = home / "empty-home"
+            empty_home.mkdir()
+            empty_vault = empty_home / "vault"
+            empty_result = self.kit_devnull(empty_home, "setup", "--yes", "--vault", str(empty_vault))
+            self.assertEqual(0, empty_result.returncode, empty_result.stderr)
+            self.assertTrue((empty_vault / ".coldvault" / "config.json").is_file())
+            self.assertTrue((empty_vault / "Home.md").is_file())
+
+    def test_setup_yes_accepts_username_for_new_vault(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            home = Path(temporary)
+            self.make_home(home)
+            vault = home / "vault"
+            with patch.object(Path, "home", return_value=home), patch.object(coldvault, "github_repos", return_value=[]), \
+                    patch("builtins.input", side_effect=AssertionError("setup --yes must not prompt")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = coldvault.setup_main(["--yes", "--vault", str(vault), "--username", "synthetic-user"])
+            self.assertEqual(0, code)
+            config = json.loads((vault / ".coldvault" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual("synthetic-user", config["username"])
+
+    def test_setup_yes_refuses_to_overwrite_existing_config(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            home = Path(temporary)
+            _, notes = self.make_home(home)
+            custom_transcripts = home / "custom-transcripts"
+            custom_transcripts.mkdir()
+            vault = home / "vault"
+            self.write_config(
+                vault,
+                custom_transcripts,
+                [str(notes)],
+                notion_exports=[str(home / "notion.zip")],
+                chatgpt_exports=[str(home / "chatgpt.zip")],
+                claude_exports=[str(home / "claude.zip")],
+                username="existing-user",
+                schedule_hours=6,
+                folders={"projects": "Work", "sessions": "Logs", "imported": "Library"},
+            )
+            config_path = vault / ".coldvault" / "config.json"
+            before = config_path.read_bytes()
+
+            refused = self.kit_devnull(home, "setup", "--yes", "--vault", str(vault), "--username", "other-user")
+            self.assertEqual(2, refused.returncode, refused.stdout + refused.stderr)
+            self.assertIn("saved config already exists", refused.stderr)
+            self.assertEqual(before, config_path.read_bytes())
+            self.assertFalse((vault / "Index.md").exists())
+            self.assertFalse((vault / ".coldvault" / "last-run.json").exists())
+
+            refused_json = self.kit_devnull(home, "setup", "--yes", "--vault", str(vault), "--json")
+            self.assertEqual(2, refused_json.returncode, refused_json.stdout + refused_json.stderr)
+            payload = json.loads(refused_json.stdout)
+            self.assertEqual(1, payload["version"])
+            self.assertIn("saved config already exists", payload["error"])
+            self.assertEqual(before, config_path.read_bytes())
+            self.assertFalse((vault / "Index.md").exists())
+
+    def test_setup_yes_requires_vault_without_hanging(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temporary:
+            home = Path(temporary)
+            result = self.kit_devnull(home, "setup", "--yes")
+            self.assertEqual(2, result.returncode)
+            self.assertIn("--yes requires --vault", result.stderr)
+            json_result = self.kit_devnull(home, "setup", "--yes", "--json")
+            self.assertEqual(2, json_result.returncode)
+            self.assertEqual({"version": 1, "error": "--yes requires --vault"}, json.loads(json_result.stdout))
+
 
 if __name__ == "__main__":
     unittest.main()
